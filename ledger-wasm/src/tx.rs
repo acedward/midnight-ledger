@@ -1720,6 +1720,22 @@ impl SystemTransaction {
             format!("{:#?}", &self.0)
         }
     }
+
+    /// The transaction hash, hex-encoded.
+    ///
+    /// Mirrors `Transaction::transactionHash` above, and delegates to the same ledger method
+    /// (`ledger::structure::SystemTransaction::transaction_hash`) that non-WASM consumers already
+    /// use -- `midnight-indexer` calls it directly on the Rust type to key its archived system
+    /// transactions.
+    ///
+    /// Without this, a JavaScript consumer can deserialize a system transaction and read its
+    /// bytes but cannot obtain its identity, so it cannot store one under the same key everything
+    /// else uses. Unlike the regular `Transaction`, there are no proof-state variants here: a
+    /// `SystemTransaction` is always hashable, so this returns no error case of its own.
+    #[wasm_bindgen(js_name = "transactionHash")]
+    pub fn transaction_hash(&self) -> Result<String, JsError> {
+        to_hex_ser(&self.0.transaction_hash())
+    }
 }
 
 #[wasm_bindgen]
