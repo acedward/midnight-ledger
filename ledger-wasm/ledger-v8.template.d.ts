@@ -2148,6 +2148,15 @@ export class SystemTransaction {
   static deserialize(raw: Uint8Array): SystemTransaction;
 
   toString(compact?: boolean): string;
+
+  /**
+   * Returns the hash associated with this system transaction.
+   *
+   * Mirrors {@link Transaction.transactionHash}, and delegates to the same ledger method
+   * non-WASM consumers already use to key system transactions. Unlike a regular transaction,
+   * a system transaction has no proof-state variants, so this is always available.
+   */
+  transactionHash(): TransactionHash;
 }
 
 /**
