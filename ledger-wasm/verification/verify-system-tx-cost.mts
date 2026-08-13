@@ -11,6 +11,12 @@
 //    any of it and computed a fullness of zero. The accumulated cost here is plainly non-zero,
 //    which is what makes zero the wrong answer rather than merely an unverified one.
 //
+//    NOTE: this normalizes against `initialParameters`, so the overall fullness it reports is a
+//    fact about the BINDINGS, not the fullness genesis closes at. Two of the five transactions are
+//    `OverwriteParameters`, and a block is closed against the limits its state ends with, so a
+//    real replay closes genesis lower. This file tests the exports; the fold that reproduces the
+//    chain's own value lives in the consuming repo.
+//
 // 2. `clampAndNormalizeFullness` agrees with `normalizeFullness` whenever the input is within
 //    the block limits. The clamping variant is not a different normalization; it differs only in
 //    the over-limit case.
