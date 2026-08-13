@@ -1554,6 +1554,22 @@ export class LedgerParameters {
   normalizeFullness(fullness: SyntheticCost): NormalizedCost;
 
   /**
+   * The per-block limit for each cost dimension -- the denominator
+   * {@link LedgerParameters.normalizeFullness} divides by.
+   */
+  readonly blockLimits: SyntheticCost;
+
+  /**
+   * Normalizes a detailed block fullness cost, clamping each dimension to its limit first.
+   *
+   * Unlike {@link LedgerParameters.normalizeFullness}, this does not throw when a limit is
+   * exceeded: it reports an overfull block as exactly full, which is what the node does when
+   * it closes a block. Use this when reproducing the chain's own fullness, and
+   * `normalizeFullness` when you want an over-limit input to be reported as an error.
+   */
+  clampAndNormalizeFullness(fullness: SyntheticCost): NormalizedCost;
+
+  /**
    * The fee prices for transaction
    */
   readonly feePrices: FeePrices;
@@ -2138,6 +2154,16 @@ export class SystemTransaction {
    * a system transaction has no proof-state variants, so this is always available.
    */
   transactionHash(): string;
+
+  /**
+   * The synthetic cost of applying this system transaction under `params`.
+   *
+   * Mirrors {@link Transaction.cost}, and delegates to the same ledger method the node calls
+   * while folding a block. Unlike a regular transaction there is no `enforceTimeToDismiss`
+   * argument and no error case: a system transaction is authored by the chain itself, so the
+   * time-to-dismiss check does not apply to it.
+   */
+  cost(params: LedgerParameters): SyntheticCost;
 }
 
 /**
