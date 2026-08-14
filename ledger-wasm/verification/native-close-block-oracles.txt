@@ -1,0 +1,5 @@
+# SHA-256(tagged_serialize(LedgerState)) from independently assembled native-Rust folds.
+# Columns: vector native_exact rounded_f64_counterweight
+# The rounded value is not an expectation; it proves each vector detects the old JS round trip.
+genesis-system-transactions 412811927ead386cb60149684117390b34ea81c7dca723945db387dbb031f662 c41b7298b8b6f034048cf6fb92e8894dbd6e70735e53cf160040c6699edbbc95
+synthetic-overlimit-q64 142e3067e26f291e0ed1446dac306c5418e50c2c4ce129c589e727e304c6a2a2 13cef874bc314372243be3bd4f4e799abdbc9cbcfc8888c0074ac72d376ba98f

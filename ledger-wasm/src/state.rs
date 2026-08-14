@@ -18,7 +18,7 @@ use crate::onchain_runtime::{ContractState, value_to_token_type};
 use crate::tx::{SystemTransaction, TransactionContext, TransactionResult, VerifiedTransaction};
 use crate::zswap_state::*;
 use crate::zswap_wasm::*;
-use base_crypto::cost_model::{FixedPoint, NormalizedCost};
+use base_crypto::cost_model::{FixedPoint, NormalizedCost, SyntheticCost};
 use base_crypto::time::Timestamp;
 use coin_structure::coin::UserAddress;
 use js_sys::{Array, BigInt, Date, Function, Map, Set, Uint8Array};
@@ -35,6 +35,38 @@ use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 pub struct LedgerState(pub(crate) ledger::structure::LedgerState<InMemoryDB>);
+
+fn clamp_and_normalize_block_cost(cost: SyntheticCost, limits: SyntheticCost) -> NormalizedCost {
+    SyntheticCost {
+        read_time: cost.read_time.min(limits.read_time),
+        compute_time: cost.compute_time.min(limits.compute_time),
+        block_usage: cost.block_usage.min(limits.block_usage),
+        bytes_written: cost.bytes_written.min(limits.bytes_written),
+        bytes_churned: cost.bytes_churned.min(limits.bytes_churned),
+    }
+    .normalize(limits)
+    .expect("a cost clamped to valid ledger block limits must normalize")
+}
+
+fn overall_block_fullness(normalized: &NormalizedCost) -> FixedPoint {
+    FixedPoint::max(
+        FixedPoint::max(
+            FixedPoint::max(normalized.read_time, normalized.compute_time),
+            normalized.block_usage,
+        ),
+        FixedPoint::max(normalized.bytes_written, normalized.bytes_churned),
+    )
+}
+
+fn close_block_exact(
+    state: &ledger::structure::LedgerState<InMemoryDB>,
+    tblock: Timestamp,
+    accumulated_cost: SyntheticCost,
+) -> Result<ledger::structure::LedgerState<InMemoryDB>, ledger::error::BlockLimitExceeded> {
+    let normalized =
+        clamp_and_normalize_block_cost(accumulated_cost, state.parameters.limits.block_limits);
+    state.post_block_update(tblock, normalized, overall_block_fullness(&normalized))
+}
 
 #[wasm_bindgen]
 impl LedgerState {
@@ -84,6 +116,26 @@ impl LedgerState {
             Timestamp::from_secs(js_date_to_seconds(tblock)),
             detailed_fullness,
             overall_fullness,
+        )?))
+    }
+
+    /// Closes a block from its accumulated raw synthetic cost without exposing normalized Q64
+    /// fixed-point values to JavaScript.
+    ///
+    /// The active block limits come from this state, after all transactions in the block have
+    /// applied. Clamping, normalization, max-of-five selection, and `post_block_update` all run in
+    /// Rust so no fullness value crosses the lossy JavaScript `f64` boundary.
+    #[wasm_bindgen(js_name = "closeBlock")]
+    pub fn close_block(
+        &self,
+        tblock: &Date,
+        accumulated_cost: JsValue,
+    ) -> Result<LedgerState, JsError> {
+        let accumulated_cost: SyntheticCost = from_value(accumulated_cost)?;
+        Ok(LedgerState(close_block_exact(
+            &self.0,
+            Timestamp::from_secs(js_date_to_seconds(tblock)),
+            accumulated_cost,
         )?))
     }
 
@@ -246,6 +298,219 @@ impl LedgerState {
         let (ledger, _) = ledger.apply_system_tx(&sys_tx_rewards, time)?;
 
         Ok(LedgerState(ledger))
+    }
+}
+
+#[cfg(test)]
+mod exact_close_tests {
+    use super::{close_block_exact, overall_block_fullness};
+    use base_crypto::cost_model::{CostDuration, FixedPoint, NormalizedCost, SyntheticCost};
+    use base_crypto::hash::persistent_hash;
+    use base_crypto::time::Timestamp;
+    use ledger::structure::{LedgerState, SystemTransaction};
+    use serialize::{tagged_deserialize, tagged_serialize};
+    use storage::db::InMemoryDB;
+
+    const NATIVE_ORACLES: &str = include_str!("../verification/native-close-block-oracles.txt");
+
+    fn expected_hash(label: &str, kind: &str) -> &'static str {
+        NATIVE_ORACLES
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                if fields.next()? == label {
+                    let native = fields.next()?;
+                    let rounded = fields.next()?;
+                    Some(match kind {
+                        "native" => native,
+                        "rounded" => rounded,
+                        _ => panic!("unknown oracle kind: {kind}"),
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing close-block oracle fixture: {label}"))
+    }
+
+    fn serialized(state: &LedgerState<InMemoryDB>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        tagged_serialize(state, &mut bytes).expect("test state must serialize");
+        bytes
+    }
+
+    fn state_hash(state: &LedgerState<InMemoryDB>) -> String {
+        format!("{:?}", persistent_hash(&serialized(state)))
+    }
+
+    fn fixture_system_transactions() -> Vec<SystemTransaction> {
+        include_str!("../verification/indexer-ground-truth.txt")
+            .lines()
+            .map(|line| {
+                let raw_hex = line
+                    .split_whitespace()
+                    .nth(3)
+                    .expect("each oracle row must contain raw transaction bytes");
+                let raw = hex::decode(raw_hex).expect("oracle transaction hex must decode");
+                tagged_deserialize(raw.as_slice())
+                    .expect("oracle transaction bytes must deserialize natively")
+            })
+            .collect()
+    }
+
+    fn genesis_pre_close_state() -> (LedgerState<InMemoryDB>, SyntheticCost) {
+        let tblock = Timestamp::from_secs(0);
+        let mut state = LedgerState::<InMemoryDB>::new("undeployed");
+        let mut accumulated = SyntheticCost::ZERO;
+
+        for tx in fixture_system_transactions() {
+            accumulated = accumulated + tx.cost(&state.parameters);
+            let (next_state, _) = state
+                .apply_system_tx(&tx, tblock)
+                .expect("the native genesis system transaction must apply");
+            state = next_state;
+        }
+
+        (state, accumulated)
+    }
+
+    fn through_f64(value: FixedPoint) -> FixedPoint {
+        FixedPoint::from(f64::from(value))
+    }
+
+    #[test]
+    fn close_block_matches_the_native_oracle_without_a_float_round_trip() {
+        let tblock = Timestamp::from_secs(0);
+        let (state, accumulated) = genesis_pre_close_state();
+        let limits = state.parameters.limits.block_limits;
+
+        // Assemble the node's oracle independently from the exported helper. In particular, the
+        // clamp and max expressions are repeated here so a shared helper cannot make both sides
+        // agree on the same wrong implementation.
+        let clamped = SyntheticCost {
+            read_time: accumulated.read_time.min(limits.read_time),
+            compute_time: accumulated.compute_time.min(limits.compute_time),
+            block_usage: accumulated.block_usage.min(limits.block_usage),
+            bytes_written: accumulated.bytes_written.min(limits.bytes_written),
+            bytes_churned: accumulated.bytes_churned.min(limits.bytes_churned),
+        };
+        let normalized = clamped
+            .normalize(limits)
+            .expect("the independently clamped oracle vector must normalize");
+        let oracle_overall = [
+            normalized.read_time,
+            normalized.compute_time,
+            normalized.block_usage,
+            normalized.bytes_written,
+            normalized.bytes_churned,
+        ]
+        .into_iter()
+        .max()
+        .expect("the five cost dimensions are non-empty");
+        let oracle = state
+            .post_block_update(tblock, normalized, oracle_overall)
+            .expect("the native oracle close must succeed");
+        let exact = close_block_exact(&state, tblock, accumulated)
+            .expect("the exact binding close must succeed");
+
+        assert_eq!(serialized(&exact), serialized(&oracle));
+
+        let rounded = NormalizedCost {
+            read_time: through_f64(normalized.read_time),
+            compute_time: through_f64(normalized.compute_time),
+            block_usage: through_f64(normalized.block_usage),
+            bytes_written: through_f64(normalized.bytes_written),
+            bytes_churned: through_f64(normalized.bytes_churned),
+        };
+        assert_ne!(
+            rounded, normalized,
+            "the oracle vector must expose Q64 precision loss"
+        );
+        let rounded_state = state
+            .post_block_update(tblock, rounded, overall_block_fullness(&rounded))
+            .expect("the rounded comparison close must remain valid");
+        assert_ne!(serialized(&exact), serialized(&rounded_state));
+
+        assert_eq!(
+            state_hash(&oracle),
+            expected_hash("genesis-system-transactions", "native"),
+            "the expected state must stay pinned to the independently assembled native fold"
+        );
+        assert_eq!(
+            state_hash(&rounded_state),
+            expected_hash("genesis-system-transactions", "rounded"),
+            "the counterweight must keep proving that this vector exposes the f64 path"
+        );
+
+        // A WASM expectation built through `clampAndNormalizeFullness` and `postBlockUpdate`
+        // would repeat the lossy path on both sides. The independent native fold plus the required
+        // rounded-state inequality closes that committed-oracle trap.
+    }
+
+    #[test]
+    fn close_block_clamps_overlimit_cost_inside_the_atomic_operation() {
+        let state = LedgerState::<InMemoryDB>::new("local-test");
+        let limits = state.parameters.limits.block_limits;
+        let accumulated = SyntheticCost {
+            read_time: limits.read_time + CostDuration::from_picoseconds(1),
+            compute_time: limits.compute_time / 5,
+            block_usage: limits.block_usage / 3,
+            bytes_written: limits.bytes_written / 11,
+            bytes_churned: limits.bytes_churned / 13,
+        };
+        let tblock = Timestamp::from_secs(1_700_000_000);
+
+        // This is deliberately independent of `clamp_and_normalize_block_cost`: omitting the
+        // clamp from the export must either fail or produce bytes different from this oracle.
+        let clamped = SyntheticCost {
+            read_time: accumulated.read_time.min(limits.read_time),
+            compute_time: accumulated.compute_time.min(limits.compute_time),
+            block_usage: accumulated.block_usage.min(limits.block_usage),
+            bytes_written: accumulated.bytes_written.min(limits.bytes_written),
+            bytes_churned: accumulated.bytes_churned.min(limits.bytes_churned),
+        };
+        assert!(accumulated.normalize(limits).is_none());
+        let normalized = clamped
+            .normalize(limits)
+            .expect("the independently clamped oracle must normalize");
+        let oracle_overall = [
+            normalized.read_time,
+            normalized.compute_time,
+            normalized.block_usage,
+            normalized.bytes_written,
+            normalized.bytes_churned,
+        ]
+        .into_iter()
+        .max()
+        .expect("the five cost dimensions are non-empty");
+        let oracle = state
+            .post_block_update(tblock, normalized, oracle_overall)
+            .expect("the native overlimit oracle close must succeed");
+        let exact = close_block_exact(&state, tblock, accumulated)
+            .expect("the atomic close must clamp rather than reject overlimit cost");
+
+        let rounded = NormalizedCost {
+            read_time: through_f64(normalized.read_time),
+            compute_time: through_f64(normalized.compute_time),
+            block_usage: through_f64(normalized.block_usage),
+            bytes_written: through_f64(normalized.bytes_written),
+            bytes_churned: through_f64(normalized.bytes_churned),
+        };
+        let rounded_state = state
+            .post_block_update(tblock, rounded, overall_block_fullness(&rounded))
+            .expect("the rounded overlimit comparison must remain valid");
+
+        assert_eq!(serialized(&exact), serialized(&oracle));
+        assert_ne!(serialized(&exact), serialized(&rounded_state));
+        assert_eq!(
+            state_hash(&oracle),
+            expected_hash("synthetic-overlimit-q64", "native")
+        );
+        assert_eq!(
+            state_hash(&rounded_state),
+            expected_hash("synthetic-overlimit-q64", "rounded")
+        );
     }
 }
 

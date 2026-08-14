@@ -600,6 +600,13 @@ export class LedgerState {
   postBlockUpdate(tblock: Date, detailedBlockFullness?: NormalizedCost, overallBlockFullness?: number): LedgerState;
 
   /**
+   * Closes a block from its accumulated raw cost. The state's active block limits are used, and
+   * clamp, normalize, max-of-five, and post-block update remain inside Rust so exact Q64 fullness
+   * never crosses the JavaScript number boundary.
+   */
+  closeBlock(tblock: Date, accumulatedCost: SyntheticCost): LedgerState;
+
+  /**
    * Retrieves the balance of the treasury for a specific token type.
    */
   treasuryBalance(token_type: TokenType): bigint;
