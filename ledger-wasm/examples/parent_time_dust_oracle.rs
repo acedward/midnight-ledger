@@ -54,9 +54,10 @@ impl ProvingProvider for StructuralProof {
         _preimage: &ProofPreimage,
         _overwrite_binding_input: Option<transient_crypto::curve::Fr>,
     ) -> Result<Proof, anyhow::Error> {
-        // ledger-wasm is compiled without proof verification, while the authoritative node fold
-        // consumes a VerifiedTransaction after admission. This structurally valid marker isolates
-        // that post-validation fold without introducing a proving server into the state oracle.
+        // ledger-wasm is compiled without contract-proof verification, while the authoritative
+        // node fold consumes a VerifiedTransaction after admission. This structurally valid marker
+        // isolates that post-validation fold without introducing a bespoke circuit/proving key;
+        // proof admission cannot observe TransactionContext.last_block_time.
         Ok(Proof(Vec::new()))
     }
 
