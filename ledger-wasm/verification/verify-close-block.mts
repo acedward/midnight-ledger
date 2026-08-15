@@ -15,7 +15,15 @@ if (!entry) throw new Error("usage: tsx verify-close-block.mts <path to midnight
 const ledger: any = await import(entry);
 
 const DIMENSIONS = ["readTime", "computeTime", "blockUsage", "bytesWritten", "bytesChurned"] as const;
-type Cost = Record<(typeof DIMENSIONS)[number], bigint>;
+type Dimension = (typeof DIMENSIONS)[number];
+type Cost = Record<Dimension, bigint>;
+const DIMENSION_LABELS: Record<Dimension, string> = {
+  readTime: "synthetic-dominant-read-time",
+  computeTime: "synthetic-dominant-compute-time",
+  blockUsage: "synthetic-dominant-block-usage",
+  bytesWritten: "synthetic-dominant-bytes-written",
+  bytesChurned: "synthetic-dominant-bytes-churned",
+};
 
 const oracleRows = readFileSync(
   new URL("./native-close-block-oracles.txt", import.meta.url),
@@ -31,6 +39,9 @@ const oracles = new Map(
     return [label, { native, rounded }];
   }),
 );
+if (oracleRows.length !== 7 || oracles.size !== 7) {
+  throw new Error(`expected 7 unique close-block oracle rows, got ${oracleRows.length}/${oracles.size}`);
+}
 
 const emptyCost = (): Cost => Object.fromEntries(DIMENSIONS.map((dimension) => [dimension, 0n])) as Cost;
 const addCost = (total: Cost, cost: Cost): void => {
@@ -98,4 +109,32 @@ verify(
   roundedClose(syntheticState, syntheticTime, syntheticCost),
 );
 
-console.log("2/2 close-block vectors match committed native-Rust oracles");
+const dimensionTime = new Date(1_700_000_100_000);
+for (const dominantDimension of DIMENSIONS) {
+  const dimensionCost = Object.fromEntries(
+    DIMENSIONS.map((dimension) => [dimension, BigInt(limits[dimension]) / 5n]),
+  ) as Cost;
+  dimensionCost[dominantDimension] = BigInt(limits[dominantDimension]) + 1n;
+
+  const overLimit = DIMENSIONS.filter(
+    (dimension) => dimensionCost[dimension] > BigInt(limits[dimension]),
+  );
+  if (overLimit.length !== 1 || overLimit[0] !== dominantDimension) {
+    throw new Error(`${dominantDimension}: expected it to be the only over-limit dimension`);
+  }
+  const normalized = syntheticState.parameters.clampAndNormalizeFullness(dimensionCost);
+  const dominantValue = Number(normalized[dominantDimension]);
+  if (!DIMENSIONS.every(
+    (dimension) => dimension === dominantDimension || Number(normalized[dimension]) < dominantValue,
+  )) {
+    throw new Error(`${dominantDimension}: expected it to be strictly dominant after normalization`);
+  }
+
+  verify(
+    DIMENSION_LABELS[dominantDimension],
+    syntheticState.closeBlock(dimensionTime, dimensionCost),
+    roundedClose(syntheticState, dimensionTime, dimensionCost),
+  );
+}
+
+console.log("7/7 close-block vectors match committed native-Rust oracles");

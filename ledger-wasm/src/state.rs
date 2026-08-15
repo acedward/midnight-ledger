@@ -379,6 +379,139 @@ mod exact_close_tests {
         FixedPoint::from(f64::from(value))
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum CostDimension {
+        ReadTime,
+        ComputeTime,
+        BlockUsage,
+        BytesWritten,
+        BytesChurned,
+    }
+
+    impl CostDimension {
+        fn index(self) -> usize {
+            match self {
+                Self::ReadTime => 0,
+                Self::ComputeTime => 1,
+                Self::BlockUsage => 2,
+                Self::BytesWritten => 3,
+                Self::BytesChurned => 4,
+            }
+        }
+    }
+
+    fn synthetic_dimension_cost(limits: SyntheticCost, dominant: CostDimension) -> SyntheticCost {
+        let mut accumulated = SyntheticCost {
+            read_time: limits.read_time / 5,
+            compute_time: limits.compute_time / 5,
+            block_usage: limits.block_usage / 5,
+            bytes_written: limits.bytes_written / 5,
+            bytes_churned: limits.bytes_churned / 5,
+        };
+        match dominant {
+            CostDimension::ReadTime => {
+                accumulated.read_time = limits.read_time + CostDuration::from_picoseconds(1)
+            }
+            CostDimension::ComputeTime => {
+                accumulated.compute_time = limits.compute_time + CostDuration::from_picoseconds(1)
+            }
+            CostDimension::BlockUsage => accumulated.block_usage = limits.block_usage + 1,
+            CostDimension::BytesWritten => accumulated.bytes_written = limits.bytes_written + 1,
+            CostDimension::BytesChurned => accumulated.bytes_churned = limits.bytes_churned + 1,
+        }
+        accumulated
+    }
+
+    fn assert_dimension_vector(label: &str, dominant: CostDimension) {
+        let state = LedgerState::<InMemoryDB>::new("local-test");
+        let limits = state.parameters.limits.block_limits;
+        let accumulated = synthetic_dimension_cost(limits, dominant);
+        let tblock = Timestamp::from_secs(1_700_000_100);
+
+        let over_limit = [
+            accumulated.read_time > limits.read_time,
+            accumulated.compute_time > limits.compute_time,
+            accumulated.block_usage > limits.block_usage,
+            accumulated.bytes_written > limits.bytes_written,
+            accumulated.bytes_churned > limits.bytes_churned,
+        ];
+        assert_eq!(over_limit.into_iter().filter(|is_over| *is_over).count(), 1);
+        assert!(over_limit[dominant.index()]);
+        assert!(accumulated.normalize(limits).is_none());
+
+        // Assemble the oracle without either production helper. Every field is clamped here,
+        // normalization is invoked directly, and the five-way maximum is taken independently.
+        let clamped = SyntheticCost {
+            read_time: accumulated.read_time.min(limits.read_time),
+            compute_time: accumulated.compute_time.min(limits.compute_time),
+            block_usage: accumulated.block_usage.min(limits.block_usage),
+            bytes_written: accumulated.bytes_written.min(limits.bytes_written),
+            bytes_churned: accumulated.bytes_churned.min(limits.bytes_churned),
+        };
+        let normalized = clamped
+            .normalize(limits)
+            .expect("the independently clamped dimension vector must normalize");
+        let normalized_values = [
+            normalized.read_time,
+            normalized.compute_time,
+            normalized.block_usage,
+            normalized.bytes_written,
+            normalized.bytes_churned,
+        ];
+        let oracle_overall = normalized_values
+            .into_iter()
+            .max()
+            .expect("the five cost dimensions are non-empty");
+        assert_eq!(normalized_values[dominant.index()], FixedPoint::ONE);
+        for (index, value) in normalized_values.into_iter().enumerate() {
+            if index != dominant.index() {
+                assert!(
+                    value < normalized_values[dominant.index()],
+                    "{dominant:?} must be strictly dominant over dimension {index}"
+                );
+            }
+        }
+
+        let oracle = state
+            .post_block_update(tblock, normalized, oracle_overall)
+            .expect("the independent native dimension oracle close must succeed");
+        let exact = close_block_exact(&state, tblock, accumulated)
+            .expect("the atomic dimension-vector close must succeed");
+        assert_eq!(serialized(&exact), serialized(&oracle));
+
+        let rounded = NormalizedCost {
+            read_time: through_f64(normalized.read_time),
+            compute_time: through_f64(normalized.compute_time),
+            block_usage: through_f64(normalized.block_usage),
+            bytes_written: through_f64(normalized.bytes_written),
+            bytes_churned: through_f64(normalized.bytes_churned),
+        };
+        assert_ne!(
+            rounded, normalized,
+            "the dimension vector must expose Q64 precision loss"
+        );
+        let rounded_overall = [
+            rounded.read_time,
+            rounded.compute_time,
+            rounded.block_usage,
+            rounded.bytes_written,
+            rounded.bytes_churned,
+        ]
+        .into_iter()
+        .max()
+        .expect("the five rounded dimensions are non-empty");
+        let rounded_state = state
+            .post_block_update(tblock, rounded, rounded_overall)
+            .expect("the rounded dimension counterweight must remain valid");
+        assert_ne!(serialized(&exact), serialized(&rounded_state));
+
+        let native_hash = state_hash(&oracle);
+        let rounded_hash = state_hash(&rounded_state);
+        println!("{label} {native_hash} {rounded_hash}");
+        assert_eq!(native_hash, expected_hash(label, "native"));
+        assert_eq!(rounded_hash, expected_hash(label, "rounded"));
+    }
+
     #[test]
     fn close_block_matches_the_native_oracle_without_a_float_round_trip() {
         let tblock = Timestamp::from_secs(0);
@@ -510,6 +643,40 @@ mod exact_close_tests {
         assert_eq!(
             state_hash(&rounded_state),
             expected_hash("synthetic-overlimit-q64", "rounded")
+        );
+    }
+
+    #[test]
+    fn close_block_covers_read_time_as_the_only_overlimit_dominant_dimension() {
+        assert_dimension_vector("synthetic-dominant-read-time", CostDimension::ReadTime);
+    }
+
+    #[test]
+    fn close_block_covers_compute_time_as_the_only_overlimit_dominant_dimension() {
+        assert_dimension_vector(
+            "synthetic-dominant-compute-time",
+            CostDimension::ComputeTime,
+        );
+    }
+
+    #[test]
+    fn close_block_covers_block_usage_as_the_only_overlimit_dominant_dimension() {
+        assert_dimension_vector("synthetic-dominant-block-usage", CostDimension::BlockUsage);
+    }
+
+    #[test]
+    fn close_block_covers_bytes_written_as_the_only_overlimit_dominant_dimension() {
+        assert_dimension_vector(
+            "synthetic-dominant-bytes-written",
+            CostDimension::BytesWritten,
+        );
+    }
+
+    #[test]
+    fn close_block_covers_bytes_churned_as_the_only_overlimit_dominant_dimension() {
+        assert_dimension_vector(
+            "synthetic-dominant-bytes-churned",
+            CostDimension::BytesChurned,
         );
     }
 }
