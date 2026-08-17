@@ -858,6 +858,46 @@ impl LedgerParameters {
         Ok(to_value(&normalized)?)
     }
 
+    /// The per-block limit for each cost dimension.
+    ///
+    /// This is the denominator `normalizeFullness` divides by. Exposing it lets a consumer see
+    /// how close a block came to each limit, and lets a clamping normalizer be checked against
+    /// the same numbers the ledger used.
+    #[wasm_bindgen(getter, js_name = "blockLimits")]
+    pub fn block_limits(&self) -> Result<JsValue, JsError> {
+        Ok(to_value(&self.0.limits.block_limits)?)
+    }
+
+    /// Normalize a block's fullness, clamping each dimension to its limit first.
+    ///
+    /// `normalizeFullness` returns `None` -- and so throws here -- when any dimension exceeds its
+    /// limit. That is not what the node does. The node clamps to the limits and then normalizes,
+    /// reporting an overfull block as exactly full rather than failing the block; see
+    /// `clamp_and_normalize` in the node's ledger helpers, which `post_block_update` calls on
+    /// every block. A consumer replaying blocks must match that behaviour or it will throw where
+    /// the chain proceeded, and diverge from the chain's own recorded state.
+    ///
+    /// Blocks should never exceed the limits -- validation is supposed to prevent it -- so this
+    /// differs from `normalizeFullness` only in the case that ought to be impossible. It is the
+    /// one to use when reproducing the chain; `normalizeFullness` is the one to use when you
+    /// want to be told that an input was over the limits.
+    #[wasm_bindgen(js_name = "clampAndNormalizeFullness")]
+    pub fn clamp_and_normalize_fullness(&self, fullness: JsValue) -> Result<JsValue, JsError> {
+        let cost: SyntheticCost = from_value(fullness)?;
+        let limits = self.0.limits.block_limits;
+        let clamped = SyntheticCost {
+            read_time: cost.read_time.min(limits.read_time),
+            compute_time: cost.compute_time.min(limits.compute_time),
+            block_usage: cost.block_usage.min(limits.block_usage),
+            bytes_written: cost.bytes_written.min(limits.bytes_written),
+            bytes_churned: cost.bytes_churned.min(limits.bytes_churned),
+        };
+        let normalized = clamped.normalize(limits).ok_or(JsError::new(
+            "a cost clamped to the block limits failed to normalize",
+        ))?;
+        Ok(to_value(&normalized)?)
+    }
+
     #[wasm_bindgen(getter)]
     pub fn dust(&self) -> Result<DustParameters, JsError> {
         Ok(DustParameters(self.0.dust))

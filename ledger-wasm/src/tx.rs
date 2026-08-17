@@ -1720,6 +1720,41 @@ impl SystemTransaction {
             format!("{:#?}", &self.0)
         }
     }
+
+    /// The transaction hash, hex-encoded.
+    ///
+    /// Mirrors `Transaction::transactionHash` above, and delegates to the same ledger method
+    /// (`ledger::structure::SystemTransaction::transaction_hash`) that non-WASM consumers already
+    /// use -- `midnight-indexer` calls it directly on the Rust type to key its archived system
+    /// transactions.
+    ///
+    /// Without this, a JavaScript consumer can deserialize a system transaction and read its
+    /// bytes but cannot obtain its identity, so it cannot store one under the same key everything
+    /// else uses. Unlike the regular `Transaction`, there are no proof-state variants here: a
+    /// `SystemTransaction` is always hashable, so this returns no error case of its own.
+    #[wasm_bindgen(js_name = "transactionHash")]
+    pub fn transaction_hash(&self) -> Result<String, JsError> {
+        to_hex_ser(&self.0.transaction_hash())
+    }
+
+    /// The synthetic cost of applying this system transaction under `params`.
+    ///
+    /// Mirrors `Transaction::cost` above, and delegates to the same ledger method
+    /// (`ledger::structure::SystemTransaction::cost`) the node calls while folding a block:
+    /// `apply_system_tx` adds this to the running block fullness exactly as the regular path
+    /// adds a transaction's cost.
+    ///
+    /// Unlike the regular `Transaction` sibling there is no `enforceTimeToDismiss` argument and
+    /// no error case -- the Rust method is infallible. A system transaction is authored by the
+    /// chain itself, so the time-to-dismiss check that can reject a user transaction does not
+    /// apply to it.
+    ///
+    /// Without this, a JavaScript consumer replaying a block can cost that block's regular
+    /// transactions but not its system transactions, so it cannot reconstruct block fullness --
+    /// and genesis, which is *only* system transactions, would always appear empty.
+    pub fn cost(&self, params: &LedgerParameters) -> Result<JsValue, JsError> {
+        Ok(to_value(&self.0.cost(params))?)
+    }
 }
 
 #[wasm_bindgen]

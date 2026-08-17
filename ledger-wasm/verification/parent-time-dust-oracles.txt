@@ -1,0 +1,7 @@
+# Native-Rust outputs from ledger-wasm/examples/parent_time_dust_oracle.rs.
+# The generator constructs and folds the transaction through native ledger types; no WASM or
+# JavaScript code participates in these expectations. The sentinel row substitutes the current
+# block time for last_block_time, matching the reference indexer's first fold after process start.
+# Columns: semantics outcome dust_state_sha256 ledger_state_sha256
+node-real-parent success eaf03bad44b34a5d81808b089f00024d29dc183e3f23b068192bda8c97bdcf23 224120766dfe9a05ae03fd1cd634f63c4154405f39ae6252956663db8e325cf0
+indexer-restart-sentinel failure f00764c4f63d1c55c2b3a6aac212fd23e0a29877f293862bb5eec18cf5d867c1 aa6fbae5040b7005f4ee01f7c2e4dae7c54d2593aa43c2bc878b249047b50db8

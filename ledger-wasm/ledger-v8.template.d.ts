@@ -600,6 +600,13 @@ export class LedgerState {
   postBlockUpdate(tblock: Date, detailedBlockFullness?: NormalizedCost, overallBlockFullness?: number): LedgerState;
 
   /**
+   * Closes a block from its accumulated raw cost. The state's active block limits are used, and
+   * clamp, normalize, max-of-five, and post-block update remain inside Rust so exact Q64 fullness
+   * never crosses the JavaScript number boundary.
+   */
+  closeBlock(tblock: Date, accumulatedCost: SyntheticCost): LedgerState;
+
+  /**
    * Retrieves the balance of the treasury for a specific token type.
    */
   treasuryBalance(token_type: TokenType): bigint;
@@ -1554,6 +1561,22 @@ export class LedgerParameters {
   normalizeFullness(fullness: SyntheticCost): NormalizedCost;
 
   /**
+   * The per-block limit for each cost dimension -- the denominator
+   * {@link LedgerParameters.normalizeFullness} divides by.
+   */
+  readonly blockLimits: SyntheticCost;
+
+  /**
+   * Normalizes a detailed block fullness cost, clamping each dimension to its limit first.
+   *
+   * Unlike {@link LedgerParameters.normalizeFullness}, this does not throw when a limit is
+   * exceeded: it reports an overfull block as exactly full, which is what the node does when
+   * it closes a block. Use this when reproducing the chain's own fullness, and
+   * `normalizeFullness` when you want an over-limit input to be reported as an error.
+   */
+  clampAndNormalizeFullness(fullness: SyntheticCost): NormalizedCost;
+
+  /**
    * The fee prices for transaction
    */
   readonly feePrices: FeePrices;
@@ -2129,6 +2152,25 @@ export class SystemTransaction {
   static deserialize(raw: Uint8Array): SystemTransaction;
 
   toString(compact?: boolean): string;
+
+  /**
+   * The transaction hash, hex-encoded.
+   *
+   * Mirrors {@link Transaction.transactionHash}, and delegates to the same ledger method
+   * non-WASM consumers already use to key system transactions. Unlike a regular transaction,
+   * a system transaction has no proof-state variants, so this is always available.
+   */
+  transactionHash(): string;
+
+  /**
+   * The synthetic cost of applying this system transaction under `params`.
+   *
+   * Mirrors {@link Transaction.cost}, and delegates to the same ledger method the node calls
+   * while folding a block. Unlike a regular transaction there is no `enforceTimeToDismiss`
+   * argument and no error case: a system transaction is authored by the chain itself, so the
+   * time-to-dismiss check does not apply to it.
+   */
+  cost(params: LedgerParameters): SyntheticCost;
 }
 
 /**
