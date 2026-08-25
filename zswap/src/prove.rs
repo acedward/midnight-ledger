@@ -141,6 +141,89 @@ impl<D: DB> Input<ProofPreimage, D> {
     }
 }
 
+/// The key location every Zswap spend preimage carries.
+pub const SPEND_KEY_LOCATION: &str = "midnight/zswap/spend";
+
+// The companion helper returns the exact public statement it proved, and
+// assembling that statement uses `verify::with_outputs`, which only exists with
+// `proof-verifying`. That is the right coupling anyway: a companion proof is
+// only useful to someone who can also verify one.
+#[cfg(feature = "proof-verifying")]
+impl<D: DB> Input<ProofPreimage, D> {
+    /// Produce a **detached companion** spend proof binding `binding` in
+    /// statement row 0 (project 00003, spend-proof memo binding).
+    ///
+    /// This is deliberately a SEPARATE method from [`Input::prove`], which is
+    /// unchanged and still calls `prover.prove(&self.proof, None)`. Both proofs
+    /// are made from the very same finalized preimage — the canonical one binds
+    /// the reserved zero and is what an unmodified node validates, the
+    /// companion binds `h = MemoHashV1(memo)` and never goes on chain.
+    ///
+    /// # Preconditions, checked before the prover is called
+    ///
+    /// * the stored `binding_input` is zero. `prove(P, None)` *retains*
+    ///   whatever the preimage holds, so a nonzero stored row 0 would silently
+    ///   poison the canonical proof as well;
+    /// * the key location is [`SPEND_KEY_LOCATION`];
+    /// * the input is user-owned. A contract input has no controlling secret to
+    ///   authenticate a memo with.
+    ///
+    /// # Provider conformance
+    ///
+    /// The override travels through
+    /// [`ProvingProvider::prove`]'s existing `overwrite_binding_input`
+    /// parameter. **Accepting that parameter is not evidence that it was
+    /// honoured**: a backend that accepts `Some(h)` and then proves the
+    /// original row-0-zero preimage produces a proof that verifies at row 0 = 0
+    /// and not at row 0 = `h`. Callers should check the returned companion
+    /// against [`crate::verify::verify_detached_spend_proof`] with
+    /// [`MemoCompanion::statement`] — and, as a control, confirm it does NOT
+    /// verify with row 0 = 0 — before trusting a backend.
+    ///
+    /// Independent prover randomness per call is the provider's job, and
+    /// [`ProvingProvider::split`] is how it is obtained; a caller producing
+    /// both proofs must hand each call its own split provider.
+    pub async fn prove_memo_companion(
+        &self,
+        prover: impl ProvingProvider,
+        binding: &crate::memo::BindingElement,
+        segment: u16,
+    ) -> Result<MemoCompanion, crate::memo::MemoCompanionError> {
+        use crate::memo::MemoCompanionError;
+
+        if self.contract_address.is_some() {
+            return Err(MemoCompanionError::ContractOwnedCarrier {
+                nullifier: self.nullifier,
+            });
+        }
+        if self.proof.binding_input != transient_crypto::curve::Fr::from(0u64) {
+            return Err(MemoCompanionError::StoredBindingInputNotZero {
+                found: crate::memo::fr_le32(self.proof.binding_input),
+            });
+        }
+        if &*self.proof.key_location.0 != SPEND_KEY_LOCATION {
+            return Err(MemoCompanionError::WrongKeyLocation {
+                found: self.proof.key_location.0.to_string(),
+                expected: SPEND_KEY_LOCATION,
+            });
+        }
+
+        let proof = prover
+            .prove(&self.proof, Some(binding.get()))
+            .await
+            .map_err(MemoCompanionError::Proving)?;
+
+        let statement = crate::verify::spend_statement(self, segment, binding.get());
+        Ok(MemoCompanion::new(
+            proof,
+            self.nullifier,
+            segment,
+            *binding,
+            statement,
+        ))
+    }
+}
+
 impl<D: DB> Output<ProofPreimage, D> {
     pub async fn prove(
         &self,
