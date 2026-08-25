@@ -28,6 +28,7 @@
 //! | [`memo_anchor_encode`] / [`memo_anchor_decode`] | the on-chain strip-evidence ciphertext |
 //! | [`memo_anchor_scan`] | find anchors in raw transaction bytes |
 //! | [`create_memo_anchor_output`] | build the zero-value carrying output |
+//! | [`memo_spend_statement_tail`] | the statement rows a wrapper carries |
 //! | [`memo_wrapper_build`] / [`memo_wrapper_parse`] | the off-chain container |
 //! | [`memo_wrapper_verify`] | verify a companion against a settled offer |
 //! | [`memo_wrapper_to_bech32m`] / [`memo_wrapper_from_bech32m`] | the display rendering |
@@ -48,7 +49,8 @@
 
 use js_sys::{Object, Reflect, Uint8Array};
 use serialize::{tagged_deserialize, tagged_serialize};
-use storage::db::InMemoryDB;
+use storage::Storable;
+use storage::db::{DB, InMemoryDB};
 use transient_crypto::curve::Fr;
 use transient_crypto::proofs::Proof;
 use wasm_bindgen::prelude::*;
@@ -57,11 +59,14 @@ use base_crypto::hash::HashOutput;
 use coin_structure::coin::{Info as CoinInfo, Nullifier};
 use rand::rngs::OsRng;
 use zswap::memo::anchor::AnchorV1;
-use zswap::memo::wrapper::{MemoWrapperV1, UntrustedLocator};
-use zswap::memo::{BindingElement, Memo, bech32m, fr_le32, memo_hash_v1 as memo_hash_v1_inner};
+use zswap::memo::wrapper::{MemoWrapperV1, STATEMENT_TAIL_ROWS, UntrustedLocator};
+use zswap::memo::{
+    BindingElement, Memo, bech32m, fr_le32, memo_hash_v1 as memo_hash_v1_inner,
+    reserved_absence_element,
+};
 
 use crate::conversions::{from_hex_ser, value_to_shielded_coininfo};
-use crate::zswap_wasm::{ZswapOutput, ZswapOutputTypes};
+use crate::zswap_wasm::{ZswapInput, ZswapInputTypes, ZswapOutput, ZswapOutputTypes};
 
 // ---------------------------------------------------------------------------
 // Small conversions, kept in one place so no binding invents its own.
@@ -213,6 +218,105 @@ pub fn create_memo_anchor_output(
         &binding_from(&h)?,
     )?;
     Ok(ZswapOutput(ZswapOutputTypes::UnprovenOutput(output)))
+}
+
+// ---------------------------------------------------------------------------
+// The spend statement tail.
+//
+// The missing piece a JavaScript consumer needed in order to assemble a wrapper
+// at all: `memo_wrapper_build` demands the statement rows, `memo_wrapper_verify`
+// rebuilds them privately, and until this binding existed nothing in between
+// could produce them. See project 00005's Q-W7.
+// ---------------------------------------------------------------------------
+
+/// Rows `1..INPUT_PIS` of the public spend statement, flattened to
+/// little-endian bytes.
+///
+/// The derivation is [`zswap::verify::spend_statement`] — the one certified
+/// producer, the same call `Input::prove_memo_companion` makes when it builds a
+/// companion and the same one `verify::verify_memo_companion` makes when it
+/// rebuilds the rows to check them. This layer performs **no row arithmetic**:
+/// it drops row 0 and flattens, and nothing else.
+fn statement_tail_le_bytes<P: Storable<D>, D: DB>(
+    input: &zswap::Input<P, D>,
+    segment: u16,
+) -> Result<Vec<u8>, String> {
+    // Fail here rather than three steps later. `verify_memo_companion` refuses a
+    // contract-owned carrier outright, so a wrapper built over such an input
+    // could never verify — a caller who got this far has already gone wrong.
+    if input.contract_address.is_some() {
+        return Err(
+            "this input is contract-owned: a contract input has no controlling secret to \
+             authenticate a memo with, so memoWrapperVerify refuses it and a wrapper built \
+             over it could never verify"
+                .to_string(),
+        );
+    }
+
+    // Row 0 is the ONLY row this argument reaches: every later row comes from
+    // the input's public fields and the segment. The row is discarded below, so
+    // the reserved zero is passed and a caller never supplies `h` here — which
+    // also means the tail of a canonical statement and the tail of a companion
+    // statement are the same 67 rows.
+    let statement = zswap::verify::spend_statement(input, segment, reserved_absence_element());
+
+    // A version 1 wrapper carries exactly `INPUT_PIS - 1` rows. If the statement
+    // length ever moved, silently handing over a differently-sized tail would be
+    // the worst outcome, so it is checked rather than assumed.
+    if statement.len() != STATEMENT_TAIL_ROWS + 1 {
+        return Err(format!(
+            "the spend statement has {} rows, but a version 1 memo wrapper carries {} tail rows",
+            statement.len(),
+            STATEMENT_TAIL_ROWS
+        ));
+    }
+
+    let mut out = Vec::with_capacity(STATEMENT_TAIL_ROWS * 32);
+    for row in &statement[1..] {
+        out.extend_from_slice(&fr_le32(*row));
+    }
+    Ok(out)
+}
+
+/// The `statementTail` argument [`memo_wrapper_build`] asks for: spend
+/// statement rows `1..INPUT_PIS`, each 32 little-endian bytes, concatenated.
+///
+/// ```text
+/// const tail = memoSpendStatementTail(input, segment);
+/// const wrapper = memoWrapperBuild(memo, input.nullifier bytes, segment,
+///                                  tail, companionProof);
+/// ```
+///
+/// **Row 0 is deliberately absent.** Row 0 is the binding input — the reserved
+/// zero for a canonical spend, `h = MemoHashV1(memo)` for a companion — and a
+/// wrapper never carries it, because a verifier derives `h` from the memo bytes
+/// it is checking rather than reading it from the artifact under test. Carrying
+/// row 0 would create exactly the second source of truth the format exists to
+/// avoid. Everything after row 0 is independent of it, which is why this
+/// binding needs no memo and no `h`.
+///
+/// The tail is public, and it is a **cross-check, not evidence**:
+/// [`memo_wrapper_verify`] rebuilds these rows from the settled offer's own
+/// input and refuses any wrapper that disagrees, so a wrong tail is caught
+/// there rather than trusted here.
+///
+/// `input` may be unproven, proven, or proof-erased — the rows read only public
+/// fields, so a caller may take the tail from the input it just constructed and
+/// the bytes still match the input that later settles. `segment` must be the
+/// segment the offer settles at; a mismatch is refused by
+/// [`memo_wrapper_verify`].
+///
+/// Throws if the input is contract-owned (no such wrapper can ever verify), or
+/// if the statement length is not the one a version 1 wrapper carries.
+#[wasm_bindgen(js_name = "memoSpendStatementTail")]
+pub fn memo_spend_statement_tail(input: &ZswapInput, segment: u16) -> Result<Uint8Array, JsError> {
+    let tail = match &input.0 {
+        ZswapInputTypes::UnprovenInput(i) => statement_tail_le_bytes(i, segment),
+        ZswapInputTypes::ProvenInput(i) => statement_tail_le_bytes(i, segment),
+        ZswapInputTypes::ProofErasedInput(i) => statement_tail_le_bytes(i, segment),
+    }
+    .map_err(|e| JsError::new(&e))?;
+    Ok(Uint8Array::from(&tail[..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -447,4 +551,257 @@ pub fn memo_anchor_token_type_of(coin: JsValue) -> Result<String, JsError> {
     let mut out = Vec::new();
     tagged_serialize(&coin.type_, &mut out)?;
     Ok(hex::encode(out))
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+//
+// These run NATIVELY (`cargo test -p midnight-ledger-wasm-v9`), which is why
+// they exercise `statement_tail_le_bytes` and the two token-type helpers rather
+// than the `#[wasm_bindgen]` functions wrapping them: `js_sys::Uint8Array` has
+// no meaning outside a JavaScript host. What the wrappers add is a `match` over
+// the three proof flavours and a `Uint8Array::from`; every byte mapping under
+// test is in the helpers, and the JS surface itself is covered end to end by
+// the Node smoke test, which builds a real wrapper from a real tail and
+// verifies it against a real proven offer.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use coin_structure::coin::ShieldedTokenType;
+    use coin_structure::contract::ContractAddress;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use storage::arena::Sp;
+    use transient_crypto::proofs::ProofPreimage;
+    use zswap::Input;
+    use zswap::keys::{SecretKeys, Seed};
+    use zswap::local;
+    use zswap::verify::spend_statement;
+
+    /// The frozen wrapper vectors, produced by an implementation other than
+    /// this one. Read for the two numbers that pin the tail's shape.
+    const WRAPPER_VECTORS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../zswap/tests/memo-vectors/wrapper.txt"
+    );
+
+    const MEMO: &[u8] = b"hello world";
+
+    /// One real, user-owned spend, built through `zswap`'s own public API —
+    /// exactly the construction `ZswapLocalState.spend` performs for a JS
+    /// caller, so the input under test is the input a JS caller holds.
+    fn user_owned_input(seed: u8, segment: u16) -> Input<ProofPreimage, InMemoryDB> {
+        let mut rng = StdRng::from_seed([seed; 32]);
+        let secret_keys: SecretKeys = Seed::random(&mut rng).into();
+        let coin = CoinInfo {
+            nonce: rng.r#gen(),
+            type_: ShieldedTokenType(rng.r#gen()),
+            value: 4_242,
+        };
+        let state: local::State<InMemoryDB> = local::State::new()
+            .insert_coin(&secret_keys, coin)
+            .expect("inserting the carrier coin");
+        let (_after, input) = state
+            .spend(&mut rng, &secret_keys, &coin.qualify(0), Some(segment))
+            .expect("spending the carrier coin");
+        input
+    }
+
+    /// The reference the binding must equal, assembled the long way round in
+    /// the test: the certified producer, sliced and flattened HERE rather than
+    /// by the code under test.
+    fn reference_tail(input: &Input<ProofPreimage, InMemoryDB>, segment: u16, row0: Fr) -> Vec<u8> {
+        spend_statement(input, segment, row0)[1..]
+            .iter()
+            .flat_map(|row| fr_le32(*row))
+            .collect()
+    }
+
+    fn h_for_memo() -> Fr {
+        memo_hash_v1_inner(&Memo::from_slice(MEMO).expect("the test memo is in range"))
+    }
+
+    /// `key: value` out of the `vector: wrapper/constants` record.
+    fn frozen_constant(key: &str) -> usize {
+        let text = std::fs::read_to_string(WRAPPER_VECTORS)
+            .unwrap_or_else(|e| panic!("reading {WRAPPER_VECTORS}: {e}"));
+        let mut in_constants = false;
+        for line in text.lines() {
+            if let Some(name) = line.strip_prefix("vector: ") {
+                in_constants = name.trim() == "wrapper/constants";
+                continue;
+            }
+            if !in_constants {
+                continue;
+            }
+            if let Some(value) = line.strip_prefix(&format!("{key}: ")) {
+                return value.trim().parse().expect("a numeric frozen constant");
+            }
+        }
+        panic!("no `{key}` in the frozen wrapper/constants record");
+    }
+
+    // -----------------------------------------------------------------------
+    // Q-W7: the statement tail.
+    // -----------------------------------------------------------------------
+
+    /// SINGLE INPUT: the bytes are `spend_statement`'s rows `1..`, exactly.
+    #[test]
+    fn tail_is_spend_statement_rows_one_onwards() {
+        let segment = 3u16;
+        let input = user_owned_input(0x11, segment);
+
+        let tail = statement_tail_le_bytes(&input, segment).expect("a user-owned input");
+
+        assert_eq!(
+            tail,
+            reference_tail(&input, segment, reserved_absence_element()),
+            "the tail must be byte-identical to zswap::verify::spend_statement's rows 1..",
+        );
+        assert_eq!(tail.len(), STATEMENT_TAIL_ROWS * 32);
+        // Row 0 is excluded, not merely different: the first 32 bytes of the
+        // tail are row 1, so the full statement's first row appears nowhere.
+        assert_eq!(
+            &tail[..32],
+            &fr_le32(spend_statement(&input, segment, reserved_absence_element())[1])[..],
+        );
+    }
+
+    /// The tail does not depend on row 0, so the canonical statement and the
+    /// companion statement share it — which is why the binding takes no memo
+    /// and no `h`, and why a caller cannot get either wrong.
+    #[test]
+    fn tail_is_independent_of_row_zero() {
+        let segment = 7u16;
+        let input = user_owned_input(0x22, segment);
+        let tail = statement_tail_le_bytes(&input, segment).expect("a user-owned input");
+
+        for row0 in [
+            reserved_absence_element(),
+            h_for_memo(),
+            Fr::from(1u64),
+            Fr::from(u64::MAX),
+        ] {
+            assert_eq!(
+                tail,
+                reference_tail(&input, segment, row0),
+                "the tail changed with row 0, which it must never do",
+            );
+        }
+    }
+
+    /// MULTI-INPUT, DISTINCT SEGMENTS: every combination matches its own
+    /// input's rows, and no two combinations collide — so the binding cannot be
+    /// returning something constant that happens to match once.
+    #[test]
+    fn tail_matches_per_input_and_per_segment() {
+        let segments = [0u16, 3, 1_024, u16::MAX];
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+
+        for seed in [0x31u8, 0x32, 0x33] {
+            for segment in segments {
+                let input = user_owned_input(seed, segment);
+                let tail = statement_tail_le_bytes(&input, segment).expect("a user-owned input");
+
+                assert_eq!(
+                    tail,
+                    reference_tail(&input, segment, reserved_absence_element()),
+                    "seed {seed:#x} segment {segment}",
+                );
+                assert_eq!(tail.len(), STATEMENT_TAIL_ROWS * 32);
+                assert!(
+                    !seen.contains(&tail),
+                    "seed {seed:#x} segment {segment} produced a tail already seen",
+                );
+                seen.push(tail);
+            }
+        }
+        assert_eq!(seen.len(), 12);
+
+        // And the same input read at two different segments really does differ,
+        // stated directly rather than inferred from the collision check above.
+        let input = user_owned_input(0x44, 5);
+        assert_ne!(
+            statement_tail_le_bytes(&input, 5).unwrap(),
+            statement_tail_le_bytes(&input, 6).unwrap(),
+        );
+    }
+
+    /// FROZEN-VECTOR-DERIVED: the tail's shape is pinned by numbers a DIFFERENT
+    /// implementation froze, not by a constant recomputed here.
+    #[test]
+    fn tail_shape_matches_the_frozen_vectors() {
+        let rows = frozen_constant("statement_tail_rows");
+        let bytes = frozen_constant("statement_tail_bytes");
+        assert_eq!(rows, 67, "the frozen record moved");
+        assert_eq!(bytes, 2_144, "the frozen record moved");
+
+        let segment = 3u16;
+        let input = user_owned_input(0x55, segment);
+        let tail = statement_tail_le_bytes(&input, segment).expect("a user-owned input");
+
+        assert_eq!(tail.len(), bytes);
+        assert_eq!(tail.len() / 32, rows);
+        assert_eq!(rows, STATEMENT_TAIL_ROWS);
+    }
+
+    /// The tail is shaped exactly as `memoWrapperBuild` expects: it is accepted
+    /// by the wrapper's own constructor, survives the container round trip, and
+    /// comes back as the rows a verifier rebuilds for the COMPANION statement.
+    #[test]
+    fn tail_is_what_a_wrapper_carries() {
+        let segment = 3u16;
+        let input = user_owned_input(0x66, segment);
+        let tail = statement_tail_le_bytes(&input, segment).expect("a user-owned input");
+
+        // Exactly the path `memo_wrapper_build` takes with this argument.
+        let rows: Vec<Fr> = tail
+            .chunks_exact(32)
+            .map(|c| Fr::from_le_bytes(c).expect("a canonical field element"))
+            .collect();
+
+        let mut stand_in_proof = Vec::new();
+        tagged_serialize(&Proof(vec![0u8; 64]), &mut stand_in_proof)
+            .expect("serializing a stand-in proof");
+
+        let wrapper = MemoWrapperV1::from_parts(
+            Memo::from_slice(MEMO).expect("the test memo is in range"),
+            input.nullifier,
+            segment,
+            rows,
+            stand_in_proof,
+            None,
+        )
+        .expect("the derived tail must satisfy the wrapper's own row-count rule");
+
+        let decoded = MemoWrapperV1::decode(&wrapper.encode()).expect("a wrapper we just encoded");
+
+        let companion_rows = spend_statement(&input, segment, h_for_memo());
+        assert_eq!(
+            decoded.claimed_statement_tail(),
+            &companion_rows[1..],
+            "a wrapper built from this tail must carry the COMPANION statement's rows 1..",
+        );
+    }
+
+    /// A contract-owned input is refused here rather than three steps later:
+    /// `verify_memo_companion` rejects a contract-owned carrier outright, so no
+    /// wrapper over one could ever verify.
+    #[test]
+    fn contract_owned_inputs_are_refused() {
+        let segment = 3u16;
+        let mut input = user_owned_input(0x77, segment);
+        assert!(statement_tail_le_bytes(&input, segment).is_ok());
+
+        input.contract_address = Some(Sp::new(ContractAddress(HashOutput([0x11u8; 32]))));
+        let message = statement_tail_le_bytes(&input, segment)
+            .expect_err("a contract-owned input must be refused");
+        assert!(
+            message.contains("contract-owned") && message.contains("memoWrapperVerify"),
+            "the refusal must say why: {message}",
+        );
+    }
 }
