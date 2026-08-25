@@ -27,7 +27,7 @@ use transient_crypto::{
 use transient_crypto_old::proofs::Zkir as ZkirOld;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use zkir::{IrMinorVersion, IrSource};
+use zkir::{IrMinorVersion, IrSource, ir_v1};
 
 struct JsKeyProvider(JsValue);
 
@@ -226,8 +226,25 @@ pub async fn prove(
     let mut res = Vec::new();
     match tag.as_str() {
         "verifier-key[v6]" => {
-            let preimage: transient_crypto_old::proofs::ProofPreimage =
-                tagged_deserialize(&mut &ser_preimage.to_vec()[..])?;
+            // The legacy arm proves a `transient_crypto_old` preimage. It used
+            // to obtain that preimage by re-deserializing `ser_preimage`, i.e.
+            // the ORIGINAL bytes — which silently discarded
+            // `overwrite_binding_input` and proved the caller's original
+            // binding input instead of the requested one.
+            //
+            // Convert the current (possibly overridden) preimage instead, using
+            // the SAME converter the native legacy prover uses
+            // (`zkir::ir_v1::preimage_to_v1`, called from
+            // `zkir::LocalProvingProvider::prove`'s `IrMinorVersion::V0 | V1`
+            // arm). Local WASM proving and native proving now derive the legacy
+            // preimage identically, so they prove the same statement.
+            //
+            // Behaviour for callers passing `overwrite_binding_input = None` is
+            // unchanged: `preimage_to_v1` is field-for-field the identity on a
+            // round-tripped preimage. That is asserted, not assumed — see
+            // `zswap-memo-companion`'s
+            // `conformance::tests::preimage_to_v1_is_the_identity_on_a_round_tripped_preimage`.
+            let preimage = ir_v1::preimage_to_v1(&preimage);
             let proof = preimage
                 .prove::<IrSource>(OsRng, &provider, &provider)
                 .await
