@@ -56,7 +56,7 @@ use transient_crypto::proofs::Proof;
 use wasm_bindgen::prelude::*;
 
 use base_crypto::hash::HashOutput;
-use coin_structure::coin::{Info as CoinInfo, Nullifier};
+use coin_structure::coin::{Info as CoinInfo, Nullifier, ShieldedTokenType};
 use rand::rngs::OsRng;
 use zswap::memo::anchor::AnchorV1;
 use zswap::memo::wrapper::{MemoWrapperV1, STATEMENT_TAIL_ROWS, UntrustedLocator};
@@ -65,7 +65,7 @@ use zswap::memo::{
     reserved_absence_element,
 };
 
-use crate::conversions::{from_hex_ser, value_to_shielded_coininfo};
+use crate::conversions::value_to_shielded_coininfo;
 use crate::zswap_wasm::{ZswapInput, ZswapInputTypes, ZswapOutput, ZswapOutputTypes};
 
 // ---------------------------------------------------------------------------
@@ -111,6 +111,37 @@ fn set(obj: &Object, key: &str, value: impl Into<JsValue>) -> Result<(), JsError
     Reflect::set(obj, &JsValue::from_str(key), &value.into())
         .map_err(|_| JsError::new("failed to build the result object"))?;
     Ok(())
+}
+
+/// A `ShieldedTokenType` as **tagged** hex — the one encoding
+/// [`memo_anchor_token_type_of`] emits and [`create_memo_anchor_output`]
+/// accepts. Kept in one place so the two halves of that pair cannot drift
+/// apart again (project 00005, Q-W6).
+///
+/// The error is `std::io::Error` rather than `JsError` so that the refusal is
+/// reachable from a native test; `JsError` can only be constructed inside a
+/// JavaScript host, which would make every message here untestable.
+fn shielded_token_type_to_tagged_hex(
+    token_type: &ShieldedTokenType,
+) -> Result<String, std::io::Error> {
+    let mut out = Vec::new();
+    tagged_serialize(token_type, &mut out)?;
+    Ok(hex::encode(out))
+}
+
+/// The inverse of [`shielded_token_type_to_tagged_hex`]. Requires the
+/// `midnight:shielded-token-type[v1]:` tag and exact consumption, so a bare
+/// untagged token type, a value of some other type, or trailing bytes are all
+/// refusals that name what was expected.
+fn shielded_token_type_from_tagged_hex(token_type: &str) -> Result<ShieldedTokenType, String> {
+    let raw = hex::decode(token_type).map_err(|e| format!("tokenType is not hexadecimal: {e}"))?;
+    tagged_deserialize(&mut &raw[..]).map_err(|e| {
+        format!(
+            "tokenType must be the TAGGED hex serialization of a ShieldedTokenType, as \
+             memoAnchorTokenTypeOf(coin) returns it — a bare untagged token type is not \
+             accepted: {e}"
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -198,10 +229,26 @@ pub fn memo_anchor_scan(bytes: Uint8Array) -> Result<js_sys::Array, JsError> {
 /// the nonce is fresh, and the recipient key pair is generated and dropped
 /// inside, so the anchor coin is unspendable by anyone — its creator included.
 ///
-/// `tokenType` is the hex-serialized `ShieldedTokenType` the rest of this API
-/// already uses. Add the result to the offer **before** balancing and proving:
-/// the output proof binds the ciphertext, so an anchor cannot be grafted onto
-/// an already-proved transaction.
+/// `tokenType` is the **tagged** hex serialization of a `ShieldedTokenType` —
+/// exactly what [`memo_anchor_token_type_of`] returns, so the documented pair
+/// composes:
+///
+/// ```text
+/// createMemoAnchorOutput(segment, memoAnchorTokenTypeOf(coin), nullifier, h)
+/// ```
+///
+/// Tagged, not bare: the 33-byte `midnight:shielded-token-type[v1]:` prefix is
+/// what makes a value of some *other* type — a coin commitment, an unshielded
+/// token type, a raw nonce — a loud refusal naming the expected tag rather than
+/// 32 bytes silently reinterpreted as a token type. Nothing else in the
+/// construction would catch that: the anchor would encode, the output would
+/// prove, and the carrier would simply be of the wrong type. A bare
+/// 64-hex-character `coin.type` string is therefore **rejected**; wrap it with
+/// [`memo_anchor_token_type_of`].
+///
+/// Add the result to the offer **before** balancing and proving: the output
+/// proof binds the ciphertext, so an anchor cannot be grafted onto an
+/// already-proved transaction.
 #[wasm_bindgen(js_name = "createMemoAnchorOutput")]
 pub fn create_memo_anchor_output(
     segment: Option<u16>,
@@ -209,7 +256,8 @@ pub fn create_memo_anchor_output(
     nullifier: Uint8Array,
     h: Uint8Array,
 ) -> Result<ZswapOutput, JsError> {
-    let token_type = from_hex_ser(token_type)?;
+    let token_type =
+        shielded_token_type_from_tagged_hex(token_type).map_err(|e| JsError::new(&e))?;
     let output = zswap::Output::<_, InMemoryDB>::new_memo_anchor(
         &mut OsRng,
         segment,
@@ -539,18 +587,29 @@ pub fn create_memo_companion_proving_payload(
     crate::create_proving_payload(serialized_preimage, Some(bigint), key_material)
 }
 
-/// The shielded token type of a coin, hex-serialized, for
+/// The shielded token type of a coin as **tagged** hex, for
 /// [`create_memo_anchor_output`].
 ///
 /// A convenience so a caller does not have to reach into a coin object and
 /// re-serialize a field by hand — getting that wrong would produce an anchor
 /// carrier of the wrong token type, which nothing else would catch.
+///
+/// The string carries the 33-byte `midnight:shielded-token-type[v1]:` tag, and
+/// [`create_memo_anchor_output`] requires that tag, so the two compose as
+/// written:
+///
+/// ```text
+/// createMemoAnchorOutput(segment, memoAnchorTokenTypeOf(coin), nullifier, h)
+/// ```
+///
+/// This is **not** the bare untagged encoding `createShieldedCoinInfo` takes,
+/// and it is deliberately not: the tag is what turns "some 32 bytes" into "a
+/// shielded token type", so a value of another type is refused instead of being
+/// reinterpreted.
 #[wasm_bindgen(js_name = "memoAnchorTokenTypeOf")]
 pub fn memo_anchor_token_type_of(coin: JsValue) -> Result<String, JsError> {
     let coin: CoinInfo = value_to_shielded_coininfo(coin)?;
-    let mut out = Vec::new();
-    tagged_serialize(&coin.type_, &mut out)?;
-    Ok(hex::encode(out))
+    Ok(shielded_token_type_to_tagged_hex(&coin.type_)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -803,5 +862,63 @@ mod tests {
             message.contains("contract-owned") && message.contains("memoWrapperVerify"),
             "the refusal must say why: {message}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Q-W6: the anchor token-type pair.
+    // -----------------------------------------------------------------------
+
+    /// The documented pair composes: what `memoAnchorTokenTypeOf` emits is what
+    /// `createMemoAnchorOutput` reads. This is the defect 00005 Q-W6 reported.
+    #[test]
+    fn the_token_type_pair_composes() {
+        let mut rng = StdRng::from_seed([0x88u8; 32]);
+        for _ in 0..8 {
+            let token_type = ShieldedTokenType(rng.r#gen());
+            let tagged = shielded_token_type_to_tagged_hex(&token_type).expect("serializing");
+            assert_eq!(
+                shielded_token_type_from_tagged_hex(&tagged).expect("the pair must compose"),
+                token_type,
+            );
+        }
+    }
+
+    /// The tag really is 33 bytes on the front, and dropping it is refused with
+    /// a message that names what was expected — rather than the old failure,
+    /// which named nothing and pointed at the wrong half of the pair.
+    #[test]
+    fn a_bare_untagged_token_type_is_refused() {
+        let token_type = ShieldedTokenType(HashOutput([0x5au8; 32]));
+        let tagged = shielded_token_type_to_tagged_hex(&token_type).expect("serializing");
+
+        // 33-byte tag + 32-byte type = 65 bytes = 130 hex characters.
+        assert_eq!(tagged.len(), 130);
+        let raw = hex::decode(&tagged).unwrap();
+        assert_eq!(&raw[..33], b"midnight:shielded-token-type[v1]:");
+        assert_eq!(&raw[33..], &token_type.0.0[..]);
+
+        let bare = hex::encode(&raw[33..]);
+        let message = shielded_token_type_from_tagged_hex(&bare)
+            .expect_err("a bare untagged token type must be refused");
+        assert!(
+            message.contains("TAGGED") && message.contains("memoAnchorTokenTypeOf"),
+            "the refusal must name the expected form: {message}",
+        );
+        assert!(
+            message.contains("midnight:shielded-token-type[v1]:"),
+            "and it must name the tag it wanted: {message}",
+        );
+    }
+
+    /// Trailing bytes and non-hexadecimal input are refusals too, so the
+    /// tagged form is exactly consumed rather than merely prefixed.
+    #[test]
+    fn a_tagged_token_type_must_be_exactly_consumed() {
+        let token_type = ShieldedTokenType(HashOutput([0x5au8; 32]));
+        let tagged = shielded_token_type_to_tagged_hex(&token_type).expect("serializing");
+
+        assert!(shielded_token_type_from_tagged_hex(&format!("{tagged}00")).is_err());
+        assert!(shielded_token_type_from_tagged_hex(&tagged[..tagged.len() - 2]).is_err());
+        assert!(shielded_token_type_from_tagged_hex("not hexadecimal").is_err());
     }
 }
