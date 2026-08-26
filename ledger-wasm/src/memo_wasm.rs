@@ -461,16 +461,25 @@ pub fn memo_wrapper_parse(bytes: Uint8Array) -> Result<Object, JsError> {
     Ok(out)
 }
 
-/// Verify a companion wrapper against a **settled, proven** Zswap offer.
+/// Verify a companion wrapper against a proven Zswap offer.
 ///
 /// `offer` is the tagged serialization of a proven `Offer`. `segment` is the
-/// segment the offer settled at.
+/// segment the offer is claimed to have settled at.
+///
+/// **This binding asserts no settlement.** It has no chain access, so it calls
+/// the library with [`Confirmation::Unconfirmed`] — the honest default for a
+/// JS caller that cannot present a settled transaction. Nothing it returns
+/// says that anything settled, and `attestedTransaction` is therefore not
+/// exposed: it would always be null (00006, finding F3).
 ///
 /// On success the returned object carries the now-authenticated memo, the
-/// input it is attributed to, and the settled anchors whose decoded
-/// `(nullifier, h)` match. An **empty** `matchingAnchors` is not a failure: it
-/// means the companion authenticated the memo but no matching anchor was found
-/// in the offer that was checked, which is a weaker state a reader must
+/// input it is attributed to, and the anchors OF THE OFFER THAT WAS CHECKED
+/// whose decoded `(nullifier, h)` match. Publication in an offer is not
+/// settlement: a matching anchor says the pair was published in the bytes
+/// handed to this function, and nothing about whether those bytes were ever
+/// accepted by a node. An **empty** `matchingAnchors` is not a failure either:
+/// it means the companion authenticated the memo but no matching anchor was
+/// found in the offer that was checked, which is a weaker state a reader must
 /// present as such. `duplicateAnchors` is an anomaly worth surfacing and is
 /// **not** a reason to downgrade authentication.
 ///
@@ -489,8 +498,15 @@ pub fn memo_wrapper_verify(
     let offer: zswap::Offer<Proof, InMemoryDB> = tagged_deserialize(&mut &offer.to_vec()[..])
         .map_err(|e| JsError::new(&format!("offer is not a readable proven Offer: {e}")))?;
 
-    let record = zswap::verify::verify_memo_companion(&wrapper, &offer, segment)
-        .map_err(|e| JsError::new(&e.to_string()))?;
+    // No chain access here, so settlement is never asserted (00006 F3): the
+    // 4th parameter is always `Unconfirmed`.
+    let record = zswap::verify::verify_memo_companion(
+        &wrapper,
+        &offer,
+        segment,
+        &zswap::verify::Confirmation::Unconfirmed,
+    )
+    .map_err(|e| JsError::new(&e.to_string()))?;
 
     let out = Object::new();
     set(

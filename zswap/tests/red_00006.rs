@@ -16,16 +16,24 @@
 //! Companion file to the toolkit's `tests/red_00006.rs`. Every test here
 //! demonstrates a defect of the **additive memo helpers this branch adds** —
 //! never of anything that exists at the pinned baseline. Each test asserts the
-//! DESIRED post-remediation behaviour, so each one FAILS on this branch today;
-//! the failure message names the finding and states what the code did instead.
+//! DESIRED post-remediation behaviour, so each one FAILED when it was written
+//! at Phase 0; the failure message names the finding and states what the code
+//! did instead.
 //!
-//! All of them are `#[ignore]`d so that `cargo test -p midnight-zswap` stays
-//! green for everyone else while the remediation workstreams are in flight:
+//! STATUS AFTER THE PHASE 1-6 INTEGRATION MERGE: all four are **GREEN**. While
+//! the remediation workstreams were in flight they were `#[ignore]`d so that
+//! `cargo test -p midnight-zswap` stayed green for everyone else; each phase
+//! removed the attribute from its own tests (Phase 1 → F1, Phase 2 → F2,
+//! Phase 3 → F3), so the file now runs in the DEFAULT suite:
 //!
 //! ```text
 //! MIDNIGHT_PP=$HOME/.cache/midnight/zk-params \
-//!   cargo test -p midnight-zswap --test red_00006 -- --ignored --test-threads=1
+//!   cargo +1.95.0 test -p midnight-zswap --locked --test red_00006
 //! ```
+//!
+//! No `#[ignore]` remains. That is safe here because the fork's default suite
+//! already proves for real (`memo::companion_tests`) and
+//! `MidnightDataProvider` finds its cache without `$MIDNIGHT_PP` being set.
 //!
 //! The tests marked `[real prover]` need the shipped Zswap key material, like
 //! `memo::companion_tests`. The rest need none: where the defect is "the
