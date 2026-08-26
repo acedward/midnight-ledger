@@ -200,7 +200,6 @@ impl ProvingProvider for StandInProver {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "RED until 00006 Phase 1 (F1) — [real prover]"]
 async fn f1_fork_prove_memo_companion_returns_a_silent_row_zero_companion() {
     let mut rng = StdRng::seed_from_u64(0x0000_06F0_0F01);
     let f = fixture(&mut rng, SEGMENT, MEMO_A);
@@ -219,7 +218,18 @@ async fn f1_fork_prove_memo_companion_returns_a_silent_row_zero_companion() {
         .await;
 
     match result {
-        Err(_) => { /* the post-remediation behaviour */ }
+        // GREEN since 00006 Phase 1: the refusal must carry the SPECIFIC
+        // diagnosis, not merely "some error". A backend that discards the
+        // override also fails the row-0-`h` test, so a producer that asked the
+        // two questions in the wrong order would still return `Err` while losing
+        // the diagnosis; this asserts the order too.
+        Err(midnight_zswap::memo::MemoCompanionError::SilentRowZeroProof) => {}
+        Err(other) => panic!(
+            "F1: `Input::prove_memo_companion` refused the SilentRowZeroProver backend, \
+             but with {other:?} instead of MemoCompanionError::SilentRowZeroProof. Spec \
+             FR-101 requires the row-0-ZERO question to be asked first so this exact \
+             diagnosis survives."
+        ),
         Ok(companion) => {
             // Show WHY this is the defect, with the crate's own verifier: the
             // returned companion verifies with row 0 = 0 and fails at row 0 = h.
@@ -260,7 +270,6 @@ async fn f1_fork_prove_memo_companion_returns_a_silent_row_zero_companion() {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "RED until 00006 Phase 2 (F2.4) — fork segment gate"]
 async fn f2_fork_prove_memo_companion_accepts_a_wrong_segment() {
     let mut rng = StdRng::seed_from_u64(0x0000_06F0_0201);
     let f = fixture(&mut rng, SEGMENT, MEMO_A);
@@ -270,35 +279,59 @@ async fn f2_fork_prove_memo_companion_accepts_a_wrong_segment() {
         "the carrier really is encoded at SEGMENT"
     );
 
+    // The stand-in prover is still the right tool here: the gate must fire
+    // BEFORE any proving cost, so reaching the prover at all would be the
+    // defect. (`prove` would then also be caught by the F1 readback, which is
+    // why the assertion below names the variant rather than accepting any Err.)
     let mut prover = StandInProver::default();
     let result = f
         .input
         .prove_memo_companion(prover.split(), &f.binding, OTHER_SEGMENT)
         .await;
 
-    assert!(
-        result.is_err(),
-        "F2 RED: `Input::prove_memo_companion` produced a companion for segment \
-         {OTHER_SEGMENT} from a carrier whose own encoded segment is {:?}. The statement \
-         it returns can never be rebuilt from that input, so the companion can never \
-         verify. Spec FR-102 requires a typed SegmentMismatch, matching the toolkit's \
-         `require_carrier_segment` gate.",
-        f.input.segment()
-    );
+    match result {
+        Err(midnight_zswap::memo::MemoCompanionError::SegmentMismatch { found, requested }) => {
+            assert_eq!(found, Some(SEGMENT));
+            assert_eq!(requested, OTHER_SEGMENT);
+        }
+        Err(other) => panic!(
+            "F2: `Input::prove_memo_companion` refused segment {OTHER_SEGMENT} from a \
+             carrier encoded at {:?}, but with {other:?} instead of \
+             MemoCompanionError::SegmentMismatch. FR-102 wants the gate BEFORE the prover, \
+             matching the toolkit's `require_carrier_segment`.",
+            f.input.segment()
+        ),
+        Ok(_) => panic!(
+            "F2 RED: `Input::prove_memo_companion` produced a companion for segment \
+             {OTHER_SEGMENT} from a carrier whose own encoded segment is {:?}. The statement \
+             it returns can never be rebuilt from that input, so the companion can never \
+             verify. Spec FR-102 requires a typed SegmentMismatch, matching the toolkit's \
+             `require_carrier_segment` gate.",
+            f.input.segment()
+        ),
+    }
 }
 
 #[tokio::test]
-#[ignore = "RED until 00006 Phase 2 (F2.3) — fork wrapper memo<->binding check"]
 async fn f2_fork_wrapper_build_accepts_a_memo_that_does_not_hash_to_the_binding() {
     let mut rng = StdRng::seed_from_u64(0x0000_06F0_0202);
     let f = fixture(&mut rng, SEGMENT, MEMO_A);
 
-    let mut prover = StandInProver::default();
+    // A REAL companion, because since 00006 Phase 1 `prove_memo_companion`
+    // verifies what it returns and a stand-in prover can no longer get one out.
+    // That is the point of this test's subject anyway: the wrapper builder must
+    // refuse the cross-wiring even when the companion itself is impeccable.
+    let resolver = resolver();
+    let mut provider = LocalProvingProvider {
+        rng: rng.split(),
+        params: &resolver,
+        resolver: &resolver,
+    };
     let companion = f
         .input
-        .prove_memo_companion(prover.split(), &f.binding, SEGMENT)
+        .prove_memo_companion(provider.split(), &f.binding, SEGMENT)
         .await
-        .expect("the stand-in prover produces a companion");
+        .expect("a real companion");
 
     // Memo B beside memo A's companion: `memo_hash_v1(MEMO_B)` is not
     // `companion.binding()`, so the wrapper can never verify anywhere.
@@ -306,10 +339,27 @@ async fn f2_fork_wrapper_build_accepts_a_memo_that_does_not_hash_to_the_binding(
     let built = MemoWrapperV1::build(unrelated, &companion, None);
 
     assert!(
-        built.is_err(),
+        matches!(
+            built,
+            Err(
+                midnight_zswap::memo::wrapper::WrapperError::MemoDoesNotMatchTheCompanionsBinding { .. }
+            )
+        ),
         "F2 RED: `MemoWrapperV1::build` accepted a memo whose MemoHashV1 is not the \
-         companion's binding element. Spec FR-102 requires a typed mismatch error on \
-         both sides."
+         companion's binding element (got {built:?}). Spec FR-102 requires a typed \
+         mismatch error on both sides."
+    );
+
+    // ...and the honest pairing still builds, so the check is not a blanket
+    // refusal (the FR-102 false-positive guard, fork side).
+    let honest = MemoWrapperV1::build(
+        Memo::from_slice(MEMO_A).expect("valid memo"),
+        &companion,
+        None,
+    );
+    assert!(
+        honest.is_ok(),
+        "a memo that DOES hash to the companion's binding must still build: {honest:?}"
     );
 }
 

@@ -387,6 +387,34 @@ pub enum MemoCompanionError {
         /// The underlying message, verbatim.
         reason: String,
     },
+    /// **The freshly produced companion verifies at row 0 = 0.**
+    ///
+    /// The backend accepted the `Some(h)` override and then proved the caller's
+    /// original row-0-zero preimage anyway. Accepting the parameter is not
+    /// evidence that it was honoured, so
+    /// [`Input::prove_memo_companion`](crate::structure::Input) measures the
+    /// answer instead of documenting the risk.
+    SilentRowZeroProof,
+    /// **The freshly produced companion does not verify at row 0 = `h`.**
+    ///
+    /// The backend proved some third statement, or returned bytes that are not
+    /// a proof of this circuit at all. Either way the artifact authenticates no
+    /// memo.
+    ProofDoesNotBindTheMemo,
+    /// **The requested segment is not the one the carrier's own final statement
+    /// encodes.**
+    ///
+    /// A companion's statement rows `1..` are derived from the input at a
+    /// segment; asking for a segment the carrier was not retargeted to yields a
+    /// statement no verifier can ever rebuild from that input, so the companion
+    /// could never verify. Refused before the prover is called, so a pre-retarget
+    /// request costs no proving work.
+    SegmentMismatch {
+        /// The segment the carrier's preimage encodes.
+        found: Option<u16>,
+        /// The segment requested.
+        requested: u16,
+    },
 }
 
 impl Display for MemoCompanionError {
@@ -413,6 +441,18 @@ impl Display for MemoCompanionError {
                     "serializing the detached companion proof failed: {reason}"
                 )
             }
+            MemoCompanionError::SilentRowZeroProof => f.write_str(
+                "the produced companion verifies at row 0 = 0: the backend accepted the override \
+                 and proved the original preimage anyway, so this is not a companion",
+            ),
+            MemoCompanionError::ProofDoesNotBindTheMemo => f.write_str(
+                "the produced companion does not verify at row 0 = h, so it binds no memo",
+            ),
+            MemoCompanionError::SegmentMismatch { found, requested } => write!(
+                f,
+                "the carrier's final statement encodes segment {found:?}, not the requested \
+                 segment {requested}"
+            ),
         }
     }
 }

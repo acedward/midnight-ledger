@@ -166,19 +166,44 @@ impl<D: DB> Input<ProofPreimage, D> {
     ///   poison the canonical proof as well;
     /// * the key location is [`SPEND_KEY_LOCATION`];
     /// * the input is user-owned. A contract input has no controlling secret to
-    ///   authenticate a memo with.
+    ///   authenticate a memo with;
+    /// * `segment` is the segment the carrier's own final statement encodes
+    ///   ([`Input::segment`]). Statement rows `1..` are derived from the input
+    ///   at a segment, so a companion made at any other segment proves a
+    ///   statement no verifier can rebuild from that input — it could never
+    ///   verify, and returning it would only move the failure downstream
+    ///   (00006 F2.4, spec FR-102). A pre-retarget request is therefore
+    ///   [`MemoCompanionError::SegmentMismatch`] before any proving cost.
     ///
-    /// # Provider conformance
+    /// # Provider conformance — checked here, not delegated to the caller
     ///
     /// The override travels through
     /// [`ProvingProvider::prove`]'s existing `overwrite_binding_input`
     /// parameter. **Accepting that parameter is not evidence that it was
     /// honoured**: a backend that accepts `Some(h)` and then proves the
     /// original row-0-zero preimage produces a proof that verifies at row 0 = 0
-    /// and not at row 0 = `h`. Callers should check the returned companion
-    /// against [`crate::verify::verify_detached_spend_proof`] with
-    /// [`MemoCompanion::statement`] — and, as a control, confirm it does NOT
-    /// verify with row 0 = 0 — before trusting a backend.
+    /// and not at row 0 = `h`, and its caller sees an ordinary success.
+    ///
+    /// This method therefore measures the answer before it returns, on the very
+    /// bytes that would otherwise have left it (an off-chain wrapper carries the
+    /// tagged proof, so the readback goes through
+    /// [`MemoCompanion::detached_proof_bytes`] and `tagged_deserialize` exactly
+    /// as a wrapper would):
+    ///
+    /// 1. the proof must **not** verify against
+    ///    [`crate::verify::canonical_spend_statement`] — asked FIRST, so a
+    ///    backend that discarded the override is diagnosed as
+    ///    [`MemoCompanionError::SilentRowZeroProof`] rather than as the vaguer
+    ///    "does not bind the memo" (a row-0-zero proof fails both questions);
+    /// 2. the proof must verify against
+    ///    [`MemoCompanion::statement`] — row 0 = `h` — under the shipped
+    ///    `SPEND_VK`, or the result is
+    ///    [`MemoCompanionError::ProofDoesNotBindTheMemo`].
+    ///
+    /// Both use [`crate::verify::verify_detached_spend_proof`], which lives
+    /// behind the same `proof-verifying` feature gate this `impl` block already
+    /// requires, so the check costs no new dependency and no key material of our
+    /// own: `SPEND_VK` is compiled in.
     ///
     /// Independent prover randomness per call is the provider's job, and
     /// [`ProvingProvider::split`] is how it is obtained; a caller producing
@@ -207,6 +232,13 @@ impl<D: DB> Input<ProofPreimage, D> {
                 expected: SPEND_KEY_LOCATION,
             });
         }
+        let found = self.segment();
+        if found != Some(segment) {
+            return Err(MemoCompanionError::SegmentMismatch {
+                found,
+                requested: segment,
+            });
+        }
 
         let proof = prover
             .prove(&self.proof, Some(binding.get()))
@@ -214,13 +246,40 @@ impl<D: DB> Input<ProofPreimage, D> {
             .map_err(MemoCompanionError::Proving)?;
 
         let statement = crate::verify::spend_statement(self, segment, binding.get());
-        Ok(MemoCompanion::new(
-            proof,
-            self.nullifier,
-            segment,
-            *binding,
-            statement,
-        ))
+        let companion = MemoCompanion::new(proof, self.nullifier, segment, *binding, statement);
+        self.admit_fresh_companion(&companion, segment)?;
+        Ok(companion)
+    }
+
+    /// The post-prove two-row readback described on
+    /// [`Input::prove_memo_companion`]. Private: there is no way to obtain an
+    /// unchecked [`MemoCompanion`] through this API.
+    fn admit_fresh_companion(
+        &self,
+        companion: &MemoCompanion,
+        segment: u16,
+    ) -> Result<(), crate::memo::MemoCompanionError> {
+        use crate::memo::MemoCompanionError;
+
+        let bytes =
+            companion
+                .detached_proof_bytes()
+                .map_err(|e| MemoCompanionError::Serialization {
+                    reason: e.to_string(),
+                })?;
+        let readback: Proof =
+            tagged_deserialize(&mut &bytes[..]).map_err(|e| MemoCompanionError::Serialization {
+                reason: e.to_string(),
+            })?;
+
+        let canonical = crate::verify::canonical_spend_statement(self, segment);
+        if crate::verify::verify_detached_spend_proof(&readback, &canonical).is_ok() {
+            return Err(MemoCompanionError::SilentRowZeroProof);
+        }
+        if crate::verify::verify_detached_spend_proof(&readback, companion.statement()).is_err() {
+            return Err(MemoCompanionError::ProofDoesNotBindTheMemo);
+        }
+        Ok(())
     }
 }
 
