@@ -62,8 +62,16 @@
 //! a later version can add optional sections without breaking a version 1
 //! reader. Sections must appear in **strictly ascending tag order** and the
 //! container must be **exactly consumed**, which together make the encoding
-//! canonical: exactly one byte string per wrapper value, with `encode` and
-//! `decode` inverse in both directions.
+//! canonical: exactly one byte string per wrapper value, i.e.
+//! `decode ∘ encode` is the identity on VALUES.
+//!
+//! The other direction is narrower. `encode ∘ decode` is the identity on BYTES
+//! only for wrappers whose sections this version KNOWS: ignoring an unknown
+//! optional tag means dropping it, so re-encoding a version-1-plus-extras
+//! wrapper yields a shorter, different byte string. That is the deliberate
+//! forward-compatibility choice, not a defect — but a caller that wants a
+//! digest must take it over the ORIGINAL transported bytes, never over a
+//! re-encoding of a decoded wrapper.
 //!
 //! # Bounded before allocation
 //!
@@ -564,8 +572,15 @@ impl MemoWrapperV1 {
     }
 
     /// Encodes the wrapper. Sections are emitted in ascending tag order, so the
-    /// encoding is canonical and `decode ∘ encode` and `encode ∘ decode` are
-    /// both the identity.
+    /// encoding is canonical: `decode ∘ encode` is the identity on values —
+    /// every wrapper has exactly one byte string.
+    ///
+    /// `encode ∘ decode` is the identity on bytes **only for wrappers built
+    /// entirely from sections this version knows**. [`Self::decode`] accepts an
+    /// unknown OPTIONAL section (tag above [`MANDATORY_SECTION_MAX`]) and
+    /// ignores it, so re-encoding such a wrapper drops it and returns different,
+    /// shorter bytes. A digest therefore belongs on the original transported
+    /// bytes, not on a re-encoding.
     pub fn encode(&self) -> Vec<u8> {
         let mut section_count: u16 = REQUIRED_SECTIONS.len() as u16;
         if self.locator.is_some() {
@@ -858,6 +873,10 @@ mod tests {
         ]
     }
 
+    /// Both directions round-trip for a wrapper whose sections are all known to
+    /// this version. The byte direction does NOT hold when an unknown optional
+    /// section is present — that case is `unknown_optional_sections_are_ignored`
+    /// below, and it is why a digest belongs on the transported bytes.
     #[test]
     fn round_trip_is_the_identity_both_ways() {
         for locator in [None, Some(&b"offer.bin"[..])] {
