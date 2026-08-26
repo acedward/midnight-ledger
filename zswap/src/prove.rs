@@ -166,7 +166,14 @@ impl<D: DB> Input<ProofPreimage, D> {
     ///   poison the canonical proof as well;
     /// * the key location is [`SPEND_KEY_LOCATION`];
     /// * the input is user-owned. A contract input has no controlling secret to
-    ///   authenticate a memo with.
+    ///   authenticate a memo with;
+    /// * `segment` is the segment the carrier's own final statement encodes
+    ///   ([`Input::segment`]). Statement rows `1..` are derived from the input
+    ///   at a segment, so a companion made at any other segment proves a
+    ///   statement no verifier can rebuild from that input — it could never
+    ///   verify, and returning it would only move the failure downstream
+    ///   (00006 F2.4, spec FR-102). A pre-retarget request is therefore
+    ///   [`MemoCompanionError::SegmentMismatch`] before any proving cost.
     ///
     /// # Provider conformance — checked here, not delegated to the caller
     ///
@@ -223,6 +230,13 @@ impl<D: DB> Input<ProofPreimage, D> {
             return Err(MemoCompanionError::WrongKeyLocation {
                 found: self.proof.key_location.0.to_string(),
                 expected: SPEND_KEY_LOCATION,
+            });
+        }
+        let found = self.segment();
+        if found != Some(segment) {
+            return Err(MemoCompanionError::SegmentMismatch {
+                found,
+                requested: segment,
             });
         }
 

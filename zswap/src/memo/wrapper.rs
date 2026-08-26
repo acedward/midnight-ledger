@@ -247,6 +247,19 @@ pub enum WrapperError {
         /// How many bytes were left over.
         extra: usize,
     },
+    /// **`memo_hash_v1(memo)` is not the companion's binding element** (00006
+    /// F2.3).
+    ///
+    /// Only reachable while BUILDING a wrapper. A verifier derives `h` from the
+    /// memo bytes itself and never reads it out of a wrapper, so a mismatched
+    /// pair authenticates nothing anywhere — emitting it would only move the
+    /// failure to the reader.
+    MemoDoesNotMatchTheCompanionsBinding {
+        /// `memo_hash_v1(memo)`, little-endian.
+        memo_hash: [u8; FR_BYTES],
+        /// The companion's binding element, little-endian.
+        binding: [u8; FR_BYTES],
+    },
 }
 
 impl Display for WrapperError {
@@ -315,6 +328,13 @@ impl Display for WrapperError {
             WrapperError::TrailingBytes { extra } => {
                 write!(f, "{extra} trailing byte(s) after the wrapper")
             }
+            WrapperError::MemoDoesNotMatchTheCompanionsBinding { memo_hash, binding } => write!(
+                f,
+                "memo_hash_v1(memo) is {}, but the companion binds {}; a verifier derives h from \
+                 the memo, so this wrapper could never authenticate anything",
+                hex_lower(memo_hash),
+                hex_lower(binding)
+            ),
         }
     }
 }
@@ -402,11 +422,27 @@ impl MemoWrapperV1 {
     /// The statement tail is taken from the companion's own statement rather
     /// than from caller-supplied metadata, so an honestly built wrapper is
     /// consistent by construction; the verifier still rebuilds and compares it.
+    ///
+    /// # The cross-wiring this refuses (00006 F2.3)
+    ///
+    /// `memo_hash_v1(memo)` must be the companion's binding element. A verifier
+    /// derives `h` from the memo bytes and never reads it out of a wrapper, so
+    /// pairing a memo with another memo's companion produces an artifact whose
+    /// only possible future is a reader's rejection. This was previously
+    /// unchecked: `build` looked only at tail length and proof shape.
     pub fn build(
         memo: Memo,
         companion: &MemoCompanion,
         locator: Option<UntrustedLocator>,
     ) -> Result<Self, WrapperError> {
+        let memo_hash = crate::memo::memo_hash_v1(&memo);
+        if memo_hash != companion.binding().get() {
+            return Err(WrapperError::MemoDoesNotMatchTheCompanionsBinding {
+                memo_hash: fr_le32(memo_hash),
+                binding: fr_le32(companion.binding().get()),
+            });
+        }
+
         let proof_bytes = companion.detached_proof_bytes().map_err(|e| {
             WrapperError::CompanionProofSerialization {
                 reason: e.to_string(),
@@ -426,6 +462,17 @@ impl MemoWrapperV1 {
     ///
     /// Used by conformance vectors and tamper harnesses; production callers
     /// want [`MemoWrapperV1::build`].
+    ///
+    /// # Deliberately permissive (00006 F2.3)
+    ///
+    /// This checks only what the ENCODING requires — tail row count, proof
+    /// present and within the size ceiling — and never the memo↔binding relation
+    /// [`MemoWrapperV1::build`] enforces. A wrapper arriving over the wire is
+    /// exactly a bag of parts with no relation guaranteed, `decode` builds one
+    /// through this path, and the tamper harnesses' whole job is to assemble
+    /// wrappers a verifier must reject. Nothing here is trusted downstream:
+    /// `verify_memo_companion` derives `h` from the memo bytes and rebuilds the
+    /// statement tail from the settled input.
     pub fn from_parts(
         memo: Memo,
         nullifier: Nullifier,

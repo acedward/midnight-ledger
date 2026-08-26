@@ -401,6 +401,20 @@ pub enum MemoCompanionError {
     /// a proof of this circuit at all. Either way the artifact authenticates no
     /// memo.
     ProofDoesNotBindTheMemo,
+    /// **The requested segment is not the one the carrier's own final statement
+    /// encodes.**
+    ///
+    /// A companion's statement rows `1..` are derived from the input at a
+    /// segment; asking for a segment the carrier was not retargeted to yields a
+    /// statement no verifier can ever rebuild from that input, so the companion
+    /// could never verify. Refused before the prover is called, so a pre-retarget
+    /// request costs no proving work.
+    SegmentMismatch {
+        /// The segment the carrier's preimage encodes.
+        found: Option<u16>,
+        /// The segment requested.
+        requested: u16,
+    },
 }
 
 impl Display for MemoCompanionError {
@@ -433,6 +447,11 @@ impl Display for MemoCompanionError {
             ),
             MemoCompanionError::ProofDoesNotBindTheMemo => f.write_str(
                 "the produced companion does not verify at row 0 = h, so it binds no memo",
+            ),
+            MemoCompanionError::SegmentMismatch { found, requested } => write!(
+                f,
+                "the carrier's final statement encodes segment {found:?}, not the requested \
+                 segment {requested}"
             ),
         }
     }
