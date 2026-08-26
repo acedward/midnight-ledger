@@ -631,3 +631,284 @@ pub const INPUT_PROOF_SIZE: usize = 4_832;
 pub const OUTPUT_PIS: usize = 77;
 pub const OUTPUT_PROOF_SIZE: usize = 4_832;
 pub const AUTHORIZED_CLAIM_PIS: usize = 13;
+
+// ---------------------------------------------------------------------------
+// Spend-proof memo binding — non-serialized helper and report types.
+//
+// ADDITIVE ONLY. Nothing below is `Serializable`, `Tagged`, or a field of
+// `Input`, `Output`, `Offer` or `Transaction`: these are in-memory results a
+// caller holds, never anything that reaches the wire, a ledger state, or a
+// consensus check. See `crate::memo` for what they are for.
+// ---------------------------------------------------------------------------
+
+/// A **detached** companion spend proof: the same finalized spend statement as
+/// the canonical proof, but with statement row 0 set to the memo commitment
+/// `h` instead of the reserved zero.
+///
+/// # This is not a spend proof
+///
+/// The inner proof is private and has **no accessor**, no `Deref`, no `AsRef`
+/// and no `Into`, so it cannot be placed in `Input.proof` through this API. The
+/// only way it leaves the type is [`MemoCompanion::detached_proof_bytes`],
+/// which hands back opaque *tagged bytes* under a name that says what they are.
+///
+/// That is a convenience, not the security boundary. The real boundary is that
+/// an unmodified verifier derives row 0 as the constant zero
+/// (`Input::<Proof>::well_formed`), so a companion substituted into
+/// `Input.proof` is rejected — by the shipped verifier key and by every node
+/// running it.
+pub struct MemoCompanion {
+    proof: transient_crypto::proofs::Proof,
+    nullifier: Nullifier,
+    segment: u16,
+    binding: crate::memo::BindingElement,
+    statement: Vec<Fr>,
+}
+
+impl MemoCompanion {
+    pub(crate) fn new(
+        proof: transient_crypto::proofs::Proof,
+        nullifier: Nullifier,
+        segment: u16,
+        binding: crate::memo::BindingElement,
+        statement: Vec<Fr>,
+    ) -> Self {
+        MemoCompanion {
+            proof,
+            nullifier,
+            segment,
+            binding,
+            statement,
+        }
+    }
+
+    /// The nullifier of the input this companion is attributed to.
+    #[inline]
+    pub fn nullifier(&self) -> Nullifier {
+        self.nullifier
+    }
+
+    /// The final segment the companion's statement was built at.
+    #[inline]
+    pub fn segment(&self) -> u16 {
+        self.segment
+    }
+
+    /// The memo commitment in statement row 0. Always nonzero.
+    #[inline]
+    pub fn binding(&self) -> crate::memo::BindingElement {
+        self.binding
+    }
+
+    /// The full public statement the companion proves: `INPUT_PIS` rows, with
+    /// row 0 equal to [`MemoCompanion::binding`].
+    #[inline]
+    pub fn statement(&self) -> &[Fr] {
+        &self.statement
+    }
+
+    /// Statement rows `1..INPUT_PIS` — everything after row 0.
+    ///
+    /// This is what an off-chain wrapper carries, as a cross-check that a
+    /// verifier compares against its own independent rebuild.
+    #[inline]
+    pub fn statement_tail(&self) -> &[Fr] {
+        &self.statement[1..]
+    }
+
+    /// The detached proof's size in bytes.
+    #[inline]
+    pub fn proof_len(&self) -> usize {
+        self.proof.0.len()
+    }
+
+    /// The proof as **tagged** bytes, for an off-chain wrapper.
+    ///
+    /// Deliberately the only way the proof leaves this type, and it leaves as
+    /// opaque bytes under a name that says what they are.
+    pub fn detached_proof_bytes(&self) -> Result<Vec<u8>, std::io::Error> {
+        let mut buf = Vec::with_capacity(self.proof.0.len() + 32);
+        serialize::tagged_serialize(&self.proof, &mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// Never renders the proof bytes.
+impl Debug for MemoCompanion {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoCompanion")
+            .field("nullifier", &crate::memo::hex_lower(&self.nullifier.0.0))
+            .field("segment", &self.segment)
+            .field(
+                "binding",
+                &crate::memo::hex_lower(&crate::memo::fr_le32(self.binding.get())),
+            )
+            .field("statement_rows", &self.statement.len())
+            .field("proof_len", &self.proof.0.len())
+            .field("status", &Symbol("DETACHED — never consensus-submittable"))
+            .finish()
+    }
+}
+
+/// One valid `AnchorV1` found on an output of the offer that was scanned.
+///
+/// A reference, not a judgement: an anchor is **strip evidence** that a memo
+/// commitment was published in the offer it was found in. It authenticates
+/// nothing on its own, and its presence says nothing about whether the
+/// transaction carrying it settled — that is a separate, caller-attested
+/// question ([`crate::verify::SettledAttestation`], 00006 finding F3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoAnchorRef {
+    /// Where the carrying output sits in the offer's (sorted) output array.
+    ///
+    /// Reported for diagnostics only. `Offer::new` sorts its outputs, so
+    /// position is not caller-controlled and must never be used to select an
+    /// anchor — match by decoded `(N, h)` instead.
+    pub output_index: usize,
+    /// The carrying output's coin commitment.
+    pub coin_com: Commitment,
+    /// The decoded anchor.
+    pub anchor: crate::memo::anchor::AnchorV1,
+}
+
+impl<P: Storable<D>, D: DB> Offer<P, D> {
+    /// Every output of this offer whose ciphertext decodes as a valid
+    /// `AnchorV1`, in output order.
+    ///
+    /// Ordinary encrypted outputs, absent ciphertexts and anchor-*shaped* but
+    /// invalid ciphertexts are all simply not anchors and are skipped; the scan
+    /// never fails and never panics. Deduplication and matching are the
+    /// caller's job, and must be done by comparing decoded `(N, h)`.
+    pub fn memo_anchors(&self) -> Vec<MemoAnchorRef> {
+        self.outputs
+            .iter_deref()
+            .enumerate()
+            .filter_map(|(output_index, output)| {
+                let ciph = output.ciphertext.as_ref()?;
+                let anchor = crate::memo::anchor::AnchorV1::decode(ciph).ok()?;
+                Some(MemoAnchorRef {
+                    output_index,
+                    coin_com: output.coin_com,
+                    anchor,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The result of a **successful** detached companion verification.
+///
+/// The constructor is crate-private and is only ever called after the
+/// companion proof has verified under the shipped `SPEND_VK` against a
+/// statement rebuilt from the canonical input, so holding one of these means
+/// the memo bytes really were authorized by whoever could spend that input.
+///
+/// It still does not mean the memo is *true*, that it was delivered, that a
+/// missing wrapper was deliberately withheld, or that anything settled: the
+/// settlement column is whatever the caller attested
+/// ([`crate::verify::Confirmation`]) and nothing more.
+#[derive(Debug, Clone)]
+pub struct MemoVerification {
+    memo: crate::memo::Memo,
+    nullifier: Nullifier,
+    segment: u16,
+    binding: crate::memo::BindingElement,
+    anchors: Vec<MemoAnchorRef>,
+    attested_tx_hash: Option<base_crypto::hash::HashOutput>,
+}
+
+impl MemoVerification {
+    pub(crate) fn new(
+        memo: crate::memo::Memo,
+        nullifier: Nullifier,
+        segment: u16,
+        binding: crate::memo::BindingElement,
+        anchors: Vec<MemoAnchorRef>,
+        attested_tx_hash: Option<base_crypto::hash::HashOutput>,
+    ) -> Self {
+        MemoVerification {
+            memo,
+            nullifier,
+            segment,
+            binding,
+            anchors,
+            attested_tx_hash,
+        }
+    }
+
+    /// The memo bytes, now safe to attribute to the input's controller.
+    #[inline]
+    pub fn authenticated_memo(&self) -> &crate::memo::Memo {
+        &self.memo
+    }
+
+    /// The input the memo is attributed to.
+    #[inline]
+    pub fn nullifier(&self) -> Nullifier {
+        self.nullifier
+    }
+
+    /// The canonical segment the statement was rebuilt at.
+    #[inline]
+    pub fn segment(&self) -> u16 {
+        self.segment
+    }
+
+    /// The memo commitment `h` the companion proved in row 0.
+    #[inline]
+    pub fn binding(&self) -> crate::memo::BindingElement {
+        self.binding
+    }
+
+    /// Anchors of the offer that was checked whose decoded `(N, h)` match this
+    /// record exactly.
+    ///
+    /// Empty means the companion authenticated the memo but no matching anchor
+    /// was found in the offer that was checked — which is a weaker state, not a
+    /// failure. A non-empty list means the commitment was published in that
+    /// offer; whether the transaction carrying it settled is
+    /// [`MemoVerification::attested_transaction`]'s question, not this one.
+    #[inline]
+    pub fn matching_anchors(&self) -> &[MemoAnchorRef] {
+        &self.anchors
+    }
+
+    /// Whether at least one matching anchor is present in the offer that was
+    /// checked. **Publication, not settlement** (00006 finding F3).
+    #[inline]
+    pub fn has_matching_anchor(&self) -> bool {
+        !self.anchors.is_empty()
+    }
+
+    /// The transaction the caller attested settled, when that attestation
+    /// really does spend this input and publish this `(N, h)`.
+    ///
+    /// `None` whenever settlement was not asserted, or was asserted for some
+    /// other transaction. It is a caller assertion either way — this crate
+    /// never observes a chain.
+    #[inline]
+    pub fn attested_transaction(&self) -> Option<base_crypto::hash::HashOutput> {
+        self.attested_tx_hash
+    }
+
+    /// Whether a matching anchor is present **and** the caller attested that
+    /// the transaction carrying it settled.
+    ///
+    /// This is the strongest state this API reports, and it is exactly as
+    /// strong as the caller's attestation — see
+    /// [`crate::verify::SettledAttestation`].
+    #[inline]
+    pub fn is_settled_anchored(&self) -> bool {
+        self.attested_tx_hash.is_some() && !self.anchors.is_empty()
+    }
+
+    /// Whether more than one matching anchor was present.
+    ///
+    /// An anomaly worth surfacing — an honest constructor emits exactly one —
+    /// but **not** a reason to downgrade authentication: the companion proof
+    /// is what authenticates, and duplicates cannot forge it.
+    #[inline]
+    pub fn has_duplicate_anchors(&self) -> bool {
+        self.anchors.len() > 1
+    }
+}

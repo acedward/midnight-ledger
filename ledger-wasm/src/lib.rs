@@ -18,6 +18,7 @@ pub mod crypto;
 pub mod dust;
 pub mod events;
 pub mod intent;
+pub mod memo_wasm;
 pub mod state;
 pub mod state_changes;
 pub mod transcript;

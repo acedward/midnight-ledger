@@ -1,0 +1,41 @@
+# INHERITED frozen vector — the exact AnchorV1 ciphertext Phase 0 put in front
+# of the SHIPPED output prover and verifier.
+#
+# These bytes were NOT produced by the Phase 1 codec. They are transcribed from
+# the Phase 0 evidence log:
+#
+#   /Users/edwardalvarado/todo/Auth Msg ZSwap/evidence/00003-spend-proof-memo-binding/phase0/assert_b_anchor_output.log
+#   SHA-256 3ce5c5c050a51a77fc77fa0d74a977c4d51e8c19c298925a8d006bbebb75c704
+#
+# produced by the Phase 0 SHAPE-ONLY encoder that Phase 1 replaced. That run is
+# the one where the unchanged `Output::well_formed` accepted the anchor under
+# the shipped OUTPUT_VK (checks B5-B8), and the anchor ciphertext of the sibling
+# `e2e/assert_b.sh` run appeared verbatim in a transaction the UNMODIFIED pinned
+# node validated, applied and finalized.
+#
+# WHY THIS RECORD EXISTS. Phase 1 rewrote `src/anchor.rs` from a shape sketch
+# into the authoritative codec, and Phase 1 also rewired
+# `src/bin/assert_b_anchor_output.rs` onto the new API. If that rewrite had
+# changed the ENCODING by even one byte, Phase 0's green evidence would silently
+# no longer describe the code in the tree. Replaying this record is what makes
+# that impossible: the Phase 1 codec must reproduce these exact bytes from the
+# same (N, h), or the replay test fails.
+#
+# `h` here is Phase 0's explicit TEST constant `Fr::from_le_bytes(
+# b"00003-phase0-assertion-A")`, NOT a MemoHashV1 output. Phase 0 deliberately
+# had no memo derivation.
+#
+# DO NOT REGENERATE. `gen_vectors` never writes this file.
+
+vector: 00003-phase0/assert-b-part1-anchor
+source: evidence/00003-spend-proof-memo-binding/phase0/assert_b_anchor_output.log
+nullifier: e81f6b7c35783ca92038af3d9ba397af92dc004b770ca2a4263efdf496a1c6f4
+h: 30303030332d7068617365302d617373657274696f6e2d410000000000000000
+h_ascii: 00003-phase0-assertion-A
+point: cb550cd538ea0cc1138480408e6eaab9b36c613f0dd3f7784fdb6eea837b13d7
+untagged_len: 115
+untagged: cb550cd538ea0cc1138480408e6eaab9b36c613f0dd3f7784fdb6eea837b13d7476d69646e696768743a7a737761702d616e63686f7204d1036fe81f6b7c35783ca92038af3d9ba397af92dc004b770ca2a4263efdf496a1c65330303030332d7068617365302d617373657274696f6e2d4100
+untagged_sha256: a09247a4e828ff55b880ed7872312caff059990cc2186eae4333f419c36b01f9
+tagged_len: 150
+tagged: 6d69646e696768743a7a737761702d636f696e2d636970686572746578745b76315d3acb550cd538ea0cc1138480408e6eaab9b36c613f0dd3f7784fdb6eea837b13d7476d69646e696768743a7a737761702d616e63686f7204d1036fe81f6b7c35783ca92038af3d9ba397af92dc004b770ca2a4263efdf496a1c65330303030332d7068617365302d617373657274696f6e2d4100
+tagged_sha256: a107c6caf97cc6e1282244aabaea1225cf852103ca577609958a38eade55518b

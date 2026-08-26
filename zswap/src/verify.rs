@@ -30,6 +30,10 @@ use storage::db::InMemoryDB;
 use storage::{Storable, arena::Sp};
 use transient_crypto::commitment::Pedersen;
 use transient_crypto::curve::{EmbeddedFr, EmbeddedGroupAffine};
+// Needed by the ADDITIVE memo-binding helpers at the bottom of this file. The
+// existing `(Fr, Fr)` tokens above are macro arguments that `Cell_write!` never
+// expands into a type position, so `Fr` was not previously in scope here.
+use transient_crypto::curve::Fr;
 #[cfg(feature = "proof-verifying")]
 use transient_crypto::hash::transient_commit;
 use transient_crypto::proofs::PARAMS_VERIFIER;
@@ -382,5 +386,628 @@ impl<D: DB> Offer<ProofPreimage, D> {
     #[instrument(skip(self))]
     pub fn well_formed(&self, segment: u16) -> Result<Pedersen, MalformedOffer> {
         offer_well_formed_common(self, segment)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spend-proof memo binding — ADDITIVE detached verification.
+//
+// Nothing below is reachable from `Offer::well_formed`, `Input::well_formed` or
+// any other consensus entry point, and nothing above was changed. In
+// particular `Input::<Proof>::well_formed` still builds
+//
+//     let mut statement = vec![0.into()];
+//
+// by hand, still never inspects an output's ciphertext for an anchor, and still
+// has no way to accept a nonzero row 0. A companion proof placed in
+// `Input.proof` is therefore rejected by the shipped `SPEND_VK` — which is
+// exactly the property that lets the canonical transaction stay acceptable to
+// unmodified nodes.
+//
+// `spend_statement` below deliberately RESTATES `well_formed`'s assembly rather
+// than refactoring `well_formed` to call it. Sharing would be tidier; leaving
+// the consensus function untouched byte for byte is worth more, because it lets
+// an auditor confirm at a glance that no validity surface moved. The
+// duplication is not left to a code reading:
+//
+//   * `memo_statement_matches_well_formed` (below) rebuilds the statement a
+//     third time, inline, and requires all three to agree; and
+//   * `memo_statement_agrees_with_the_shipped_verifier` (integration test)
+//     requires a REAL canonical proof to verify against
+//     `spend_statement(input, segment, 0)` and a REAL companion proof to verify
+//     against `spend_statement(input, segment, h)` and NOT against row 0 = 0.
+//     A statement that differed from `well_formed`'s by a single row would fail
+//     that test, because the proof would not verify.
+// ---------------------------------------------------------------------------
+
+/// Rebuild the public spend statement for `input` at `segment`, with `row0` in
+/// statement position 0.
+///
+/// `row0 = Fr::from(0)` reproduces exactly what every unmodified verifier
+/// derives. `row0 = h` is the detached companion statement.
+///
+/// This reads only public fields of the input, so it is generic over the proof
+/// type: the same call works on an unproven `Input<ProofPreimage, _>` and on a
+/// settled `Input<Proof, _>`.
+#[cfg(feature = "proof-verifying")]
+pub fn spend_statement<P: Storable<D>, D: DB>(
+    input: &Input<P, D>,
+    segment: u16,
+    row0: Fr,
+) -> Vec<Fr> {
+    let mut prog = Vec::new();
+    prog.extend::<[Op<ResultModeGather, InMemoryDB>; 6]>(HistoricMerkleTree_check_root!(
+        [Key::Value(0u8.into())],
+        false,
+        32,
+        [u8; 32],
+        input.merkle_tree_root
+    ));
+    prog.extend(Set_insert!(
+        [Key::Value(1u8.into())],
+        false,
+        [u8; 32],
+        input.nullifier
+    ));
+    match &input.contract_address {
+        Some(addr) => prog.extend(Cell_write!(
+            [Key::Value(3u8.into())],
+            false,
+            ContractAddress,
+            *addr.deref()
+        )),
+        None => prog.push(Op::Noop { n: CADDR_OP_LEN }),
+    }
+    prog.extend(Cell_read!([Key::Value(5u8.into())], false, u16));
+    prog.extend(Cell_write!(
+        [Key::Value(2u8.into())],
+        false,
+        (Fr, Fr),
+        input.value_commitment.0
+    ));
+
+    let mut statement = vec![row0];
+    for op in with_outputs(prog.into_iter(), [true.into(), segment.into()].into_iter()) {
+        op.field_repr(&mut statement);
+    }
+    statement
+}
+
+/// The statement every unmodified verifier derives: row 0 pinned to zero.
+#[cfg(feature = "proof-verifying")]
+pub fn canonical_spend_statement<P: Storable<D>, D: DB>(
+    input: &Input<P, D>,
+    segment: u16,
+) -> Vec<Fr> {
+    spend_statement(input, segment, crate::memo::reserved_absence_element())
+}
+
+/// The **row-0 admission check**: the reserved-zero rule at the verification
+/// boundary.
+///
+/// A verifier reading `h` out of an untrusted wrapper or a decoded anchor calls
+/// this before any statement or proof work. Reaching the rejection needs no
+/// hash preimage, no `Input` and no key material.
+pub fn admit_companion_row0(
+    row0: Fr,
+) -> Result<crate::memo::BindingElement, crate::memo::ReservedBindingElement> {
+    crate::memo::BindingElement::new(row0)
+}
+
+/// Verify a shipped-format spend proof against `statement` under the shipped
+/// `SPEND_VK`.
+///
+/// **Detached and non-consensus.** This is the same verifier call
+/// `Input::<Proof>::well_formed` makes, with the statement supplied by the
+/// caller instead of derived with a zero row 0.
+#[cfg(feature = "proof-verifying")]
+pub fn verify_detached_spend_proof(
+    proof: &Proof,
+    statement: &[Fr],
+) -> Result<(), MalformedOffer> {
+    SPEND_VK
+        .verify(
+            &transient_crypto_old::proofs::PARAMS_VERIFIER,
+            &transient_crypto_old::proofs::Proof(proof.0.clone()),
+            statement.iter().map(|f| {
+                transient_crypto_old::curve::Fr::from_le_bytes(&f.as_le_bytes())
+                    .expect("Fr round-trip")
+            }),
+        )
+        .map_err(|e| MalformedOffer::InvalidProof(anyhow::anyhow!("{e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Settlement evidence — the reader-facing trust boundary (00006, finding F3).
+//
+// Before 00006 this file's `verify_memo_companion` had no confirmation
+// parameter at all, and its result type described its anchors as settled facts.
+// Nothing in an offline verifier can observe settlement, so the honest form of
+// the claim is a CALLER ASSERTION that is typed and BOUND to one transaction —
+// which is what the two types below are.
+// ---------------------------------------------------------------------------
+
+/// Why a [`SettledAttestation`] could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettlementEvidenceError {
+    /// No transaction bytes were supplied. An attestation with nothing to bind
+    /// to is exactly the unbound assertion this type exists to abolish.
+    NoTransactionBytes,
+    /// `SHA-256(transaction bytes)` is not the transaction hash the caller says
+    /// it observed finalized, so the two halves describe different objects.
+    TransactionHashMismatch {
+        /// What the caller said was finalized.
+        attested: base_crypto::hash::HashOutput,
+        /// What the supplied bytes actually hash to.
+        recomputed: base_crypto::hash::HashOutput,
+    },
+}
+
+impl core::fmt::Display for SettlementEvidenceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SettlementEvidenceError::NoTransactionBytes => {
+                f.write_str("a settlement attestation needs the transaction bytes it attests to")
+            }
+            SettlementEvidenceError::TransactionHashMismatch {
+                attested,
+                recomputed,
+            } => write!(
+                f,
+                "the attested transaction hash {} is not the persistent hash of the supplied \
+                 bytes ({})",
+                crate::memo::hex_lower(&attested.0),
+                crate::memo::hex_lower(&recomputed.0)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SettlementEvidenceError {}
+
+/// A caller's typed assertion that ONE EXACT transaction settled.
+///
+/// Detached verification is offline by construction, so this crate can never
+/// *observe* settlement. What it can do — and what 00006 makes it do — is
+/// refuse to spend an assertion about transaction X on evidence that lives in
+/// transaction Y:
+///
+///  * [`SettledAttestation::for_transaction`] recomputes the transaction hash
+///    from the bytes supplied and refuses anything but the attested value.
+///    `persistent_hash` is exactly how `Transaction::transaction_hash` is
+///    defined (SHA-256 over the tagged serialization), so the check is the same
+///    one a node's own hash agrees with; and
+///  * [`SettledAttestation::covers_input`] and
+///    [`SettledAttestation::covers_anchor`] require the attributed nullifier
+///    and the wrapper's exact `(N, h)` anchor to be present in those bytes.
+///
+/// What it still does not establish, and what no offline verifier could: that
+/// the attested transaction was ever accepted by a node. Accessors that depend
+/// on settlement say "attested" in their names and docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledAttestation {
+    tx_hash: base_crypto::hash::HashOutput,
+    tx_bytes: Vec<u8>,
+}
+
+impl SettledAttestation {
+    /// The caller observed the transaction whose bytes are `tx_bytes` validated,
+    /// applied and finalized under `observed_tx_hash`.
+    pub fn for_transaction(
+        tx_bytes: &[u8],
+        observed_tx_hash: base_crypto::hash::HashOutput,
+    ) -> Result<Self, SettlementEvidenceError> {
+        if tx_bytes.is_empty() {
+            return Err(SettlementEvidenceError::NoTransactionBytes);
+        }
+        let recomputed = base_crypto::hash::persistent_hash(tx_bytes);
+        if recomputed != observed_tx_hash {
+            return Err(SettlementEvidenceError::TransactionHashMismatch {
+                attested: observed_tx_hash,
+                recomputed,
+            });
+        }
+        Ok(SettledAttestation {
+            tx_hash: observed_tx_hash,
+            tx_bytes: tx_bytes.to_vec(),
+        })
+    }
+
+    /// The transaction this attestation is bound to.
+    #[inline]
+    pub fn transaction_hash(&self) -> base_crypto::hash::HashOutput {
+        self.tx_hash
+    }
+
+    /// The attested transaction's bytes.
+    #[inline]
+    pub fn transaction_bytes(&self) -> &[u8] {
+        &self.tx_bytes
+    }
+
+    /// Whether the attested transaction spends `nullifier`.
+    ///
+    /// A `Nullifier` is a 32-byte `HashOutput` written verbatim by
+    /// `Serializable`, so its bytes occur in any serialization containing the
+    /// input — which is how this is answered without deserializing a
+    /// `Transaction` (the `ledger` crate depends on this one, never the
+    /// reverse).
+    pub fn covers_input(&self, nullifier: coin_structure::coin::Nullifier) -> bool {
+        contains_subslice(&self.tx_bytes, &nullifier.0.0)
+    }
+
+    /// Whether the attested transaction publishes exactly this `(N, h)` anchor.
+    ///
+    /// Matching is by DECODED `(N, h)` through
+    /// [`crate::memo::anchor::scan_untagged_anchors`] — never by position and
+    /// never by a lookalike re-encoding.
+    pub fn covers_anchor(&self, want: &crate::memo::anchor::AnchorV1) -> bool {
+        crate::memo::anchor::scan_untagged_anchors(&self.tx_bytes)
+            .iter()
+            .any(|s| &s.anchor == want)
+    }
+}
+
+/// Whether the caller asserts the transaction carrying this offer settled.
+///
+/// [`Confirmation::Unconfirmed`] is the honest default for any reader that has
+/// not watched the chain; the resulting [`MemoVerification`] then reports no
+/// attested settlement and its accessors say so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirmation {
+    /// The transaction has not been observed settled.
+    Unconfirmed,
+    /// The caller attests that this exact transaction settled.
+    Settled(SettledAttestation),
+}
+
+impl Confirmation {
+    /// Shorthand for [`SettledAttestation::for_transaction`].
+    pub fn settled(
+        tx_bytes: &[u8],
+        observed_tx_hash: base_crypto::hash::HashOutput,
+    ) -> Result<Self, SettlementEvidenceError> {
+        SettledAttestation::for_transaction(tx_bytes, observed_tx_hash).map(Confirmation::Settled)
+    }
+
+    /// The attestation, if settlement was asserted at all.
+    #[inline]
+    pub fn attestation(&self) -> Option<&SettledAttestation> {
+        match self {
+            Confirmation::Unconfirmed => None,
+            Confirmation::Settled(a) => Some(a),
+        }
+    }
+}
+
+/// Whether `haystack` contains `needle`.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Verify an off-chain companion wrapper against a canonical offer.
+///
+/// The whole check, in order, so that a refusal costs as little as possible and
+/// says as much as possible:
+///
+/// 1. locate the attributed input **in the offer** by nullifier, refusing a
+///    duplicate rather than picking one;
+/// 2. refuse a contract-owned carrier;
+/// 3. require the wrapper's claimed segment to be the canonical one;
+/// 4. derive `h` from the memo bytes — it is **never read out of the
+///    wrapper** — and refuse the reserved zero;
+/// 5. rebuild statement rows `1..` from the canonical input and require the
+///    wrapper's carried copy to equal them, row by row;
+/// 6. only then deserialize the companion proof and verify it under the shipped
+///    `SPEND_VK` with row 0 = `h`;
+/// 7. collect the anchors of this offer whose decoded `(N, h)` match; and
+/// 8. record whether `confirmation` attests a transaction that actually carries
+///    this evidence.
+///
+/// Step 4 is what makes memo tampering fail twice over: `h` is derived, so an
+/// altered memo breaks proof verification *and* anchor matching at once, with
+/// no separate check to forget. Step 5 is what makes the carried statement a
+/// cross-check rather than an input — a wrapper cannot talk the verifier into
+/// checking a statement of its own choosing. Step 8 is 00006's finding F3: this
+/// function used to describe every matching anchor as settled strip evidence
+/// with no way for a caller to say otherwise.
+///
+/// A missing or non-matching anchor is **not** a failure: it produces a
+/// [`MemoVerification`] with no matching anchors, which a reader must present
+/// as a weaker state than an anchored one. Neither is an attestation that does
+/// not cover this memo — it simply leaves the result unattested.
+#[cfg(feature = "proof-verifying")]
+pub fn verify_memo_companion<P: Storable<D> + Ord, D: DB>(
+    wrapper: &crate::memo::wrapper::MemoWrapperV1,
+    offer: &Offer<P, D>,
+    settled_segment: u16,
+    confirmation: &Confirmation,
+) -> Result<MemoVerification, crate::memo::MemoVerifyError> {
+    use crate::memo::MemoVerifyError;
+
+    let nullifier = wrapper.nullifier();
+    // Resolve the carrier BY VALUE and refuse a duplicate: `.find()` would
+    // silently pick the first of several inputs claiming the same nullifier
+    // (00006, finding F3).
+    let carriers: Vec<&Input<P, D>> = offer
+        .inputs
+        .iter_deref()
+        .filter(|i| i.nullifier == nullifier)
+        .collect();
+    let input = match carriers.len() {
+        0 => return Err(MemoVerifyError::AttributedInputNotFound { nullifier }),
+        1 => carriers[0].clone(),
+        count => return Err(MemoVerifyError::DuplicateAttributedInput { nullifier, count }),
+    };
+
+    if input.contract_address.is_some() {
+        return Err(MemoVerifyError::ContractOwnedCarrier { nullifier });
+    }
+
+    if wrapper.segment() != settled_segment {
+        return Err(MemoVerifyError::SegmentMismatch {
+            claimed: wrapper.segment(),
+            settled: settled_segment,
+        });
+    }
+
+    // `h` is DERIVED from the memo bytes. It is never carried, so there is no
+    // second source of truth a tampered wrapper could exploit.
+    let binding = admit_companion_row0(crate::memo::memo_hash_v1(wrapper.unverified_memo()))?;
+
+    let statement = spend_statement(&input, settled_segment, binding.get());
+    let claimed = wrapper.claimed_statement_tail();
+    if claimed.len() != statement.len() - 1 {
+        return Err(MemoVerifyError::StatementRowCount {
+            found: claimed.len(),
+            expected: statement.len() - 1,
+        });
+    }
+    for (i, (rebuilt, carried)) in statement[1..].iter().zip(claimed.iter()).enumerate() {
+        if rebuilt != carried {
+            return Err(MemoVerifyError::StatementRowMismatch { row: i + 1 });
+        }
+    }
+
+    let mut proof_bytes = wrapper.companion_proof_bytes();
+    let proof: Proof = tagged_deserialize(&mut proof_bytes).map_err(|e| {
+        MemoVerifyError::MalformedCompanionProof {
+            reason: e.to_string(),
+        }
+    })?;
+    if !proof_bytes.is_empty() {
+        return Err(MemoVerifyError::MalformedCompanionProof {
+            reason: format!(
+                "{} trailing byte(s) after the companion proof",
+                proof_bytes.len()
+            ),
+        });
+    }
+
+    verify_detached_spend_proof(&proof, &statement).map_err(|e| {
+        MemoVerifyError::CompanionProofRejected {
+            reason: e.to_string(),
+        }
+    })?;
+
+    // Anchors are matched by DECODED `(N, h)`, never by output position:
+    // `Offer::new` sorts its outputs, so position is not caller-controlled.
+    let want = crate::memo::anchor::AnchorV1::new(nullifier, binding);
+    let anchors: Vec<MemoAnchorRef> = offer
+        .memo_anchors()
+        .into_iter()
+        .filter(|a| a.anchor == want)
+        .collect();
+
+    // Settlement is a SEPARATE, BOUND question (00006 finding F3). An
+    // attestation counts only if the transaction it names really is the one
+    // carrying this evidence: it must spend the attributed input AND publish
+    // this exact `(N, h)`.
+    let attested_tx_hash = match confirmation {
+        Confirmation::Unconfirmed => None,
+        Confirmation::Settled(attestation) => (attestation.covers_input(nullifier)
+            && attestation.covers_anchor(&want))
+        .then(|| attestation.transaction_hash()),
+    };
+
+    Ok(MemoVerification::new(
+        wrapper.unverified_memo().clone(),
+        nullifier,
+        settled_segment,
+        binding,
+        anchors,
+        attested_tx_hash,
+    ))
+}
+
+#[cfg(all(test, feature = "proof-verifying"))]
+mod memo_statement_tests {
+    use super::*;
+    use crate::memo::{BindingElement, Memo};
+    use base_crypto::hash::HashOutput;
+    use coin_structure::coin::Nullifier;
+    use transient_crypto::commitment::Pedersen;
+    use transient_crypto::merkle_tree::MerkleTreeDigest;
+
+    /// Builds an `Input` with no proof at all — the statement rebuild reads
+    /// only public fields, which is exactly the point.
+    fn bare_input(nullifier_seed: u8, contract: bool) -> Input<(), InMemoryDB> {
+        let mut raw = [0u8; 32];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(nullifier_seed);
+        }
+        Input {
+            nullifier: Nullifier(HashOutput(raw)),
+            value_commitment: Pedersen(EmbeddedGroupAffine::generator()),
+            contract_address: if contract {
+                Some(Sp::new(ContractAddress::default()))
+            } else {
+                None
+            },
+            merkle_tree_root: MerkleTreeDigest::default(),
+            proof: Arc::new(()),
+        }
+    }
+
+    /// A THIRD, inline rebuild, transcribed from `Input::<Proof>::well_formed`
+    /// above. If either copy drifts, this fails.
+    fn inline_rebuild(input: &Input<(), InMemoryDB>, segment: u16, row0: Fr) -> Vec<Fr> {
+        let mut prog = Vec::new();
+        prog.extend::<[Op<ResultModeGather, InMemoryDB>; 6]>(HistoricMerkleTree_check_root!(
+            [Key::Value(0u8.into())],
+            false,
+            32,
+            [u8; 32],
+            input.merkle_tree_root
+        ));
+        prog.extend(Set_insert!(
+            [Key::Value(1u8.into())],
+            false,
+            [u8; 32],
+            input.nullifier
+        ));
+        match &input.contract_address {
+            Some(addr) => prog.extend(Cell_write!(
+                [Key::Value(3u8.into())],
+                false,
+                ContractAddress,
+                *addr.deref()
+            )),
+            None => prog.push(Op::Noop { n: CADDR_OP_LEN }),
+        }
+        prog.extend(Cell_read!([Key::Value(5u8.into())], false, u16));
+        prog.extend(Cell_write!(
+            [Key::Value(2u8.into())],
+            false,
+            (Fr, Fr),
+            input.value_commitment.0
+        ));
+        let mut statement = vec![row0];
+        for op in with_outputs(prog.into_iter(), [true.into(), segment.into()].into_iter()) {
+            op.field_repr(&mut statement);
+        }
+        statement
+    }
+
+    #[test]
+    fn memo_statement_matches_well_formed() {
+        for contract in [false, true] {
+            for segment in [0u16, 1, 3, u16::MAX] {
+                let input = bare_input(5, contract);
+                let mine = spend_statement(&input, segment, Fr::from(0u64));
+                let theirs = inline_rebuild(&input, segment, Fr::from(0u64));
+                assert_eq!(mine, theirs, "contract={contract} segment={segment}");
+                assert_eq!(mine.len(), INPUT_PIS);
+            }
+        }
+    }
+
+    #[test]
+    fn only_row_zero_differs_between_canonical_and_companion() {
+        let input = bare_input(9, false);
+        let h = BindingElement::for_memo(&Memo::from_slice(b"hello world").unwrap()).unwrap();
+        let canonical = canonical_spend_statement(&input, 3);
+        let companion = spend_statement(&input, 3, h.get());
+        assert_eq!(canonical.len(), companion.len());
+        assert_eq!(canonical.len(), INPUT_PIS);
+        assert_eq!(canonical[0], Fr::from(0u64));
+        assert_eq!(companion[0], h.get());
+        assert_eq!(canonical[1..], companion[1..]);
+    }
+
+    #[test]
+    fn the_statement_binds_the_nullifier_the_root_and_the_segment() {
+        let base = spend_statement(&bare_input(1, false), 3, Fr::from(0u64));
+        assert_ne!(base, spend_statement(&bare_input(2, false), 3, Fr::from(0u64)));
+        assert_ne!(base, spend_statement(&bare_input(1, false), 4, Fr::from(0u64)));
+        assert_ne!(base, spend_statement(&bare_input(1, true), 3, Fr::from(0u64)));
+    }
+
+    /// A settlement attestation cannot be built from a hash that is not the
+    /// hash of the bytes supplied — the check the Phase 5 e2e harness used to
+    /// perform by hand (00006 finding F3, spec FR-103).
+    #[test]
+    fn an_attestation_whose_hash_does_not_match_its_bytes_is_refused() {
+        let bytes = b"the settled transaction".to_vec();
+        let right = base_crypto::hash::persistent_hash(&bytes);
+        let mut wrong_raw = right.0;
+        wrong_raw[0] ^= 0xff;
+        let wrong = HashOutput(wrong_raw);
+
+        assert_eq!(
+            SettledAttestation::for_transaction(&bytes, wrong),
+            Err(SettlementEvidenceError::TransactionHashMismatch {
+                attested: wrong,
+                recomputed: right,
+            })
+        );
+        assert_eq!(
+            SettledAttestation::for_transaction(&[], right),
+            Err(SettlementEvidenceError::NoTransactionBytes)
+        );
+
+        let good = SettledAttestation::for_transaction(&bytes, right).expect("well formed");
+        assert_eq!(good.transaction_hash(), right);
+        assert_eq!(good.transaction_bytes(), &bytes[..]);
+        assert_eq!(
+            Confirmation::settled(&bytes, right).unwrap().attestation(),
+            Some(&good)
+        );
+        assert_eq!(Confirmation::Unconfirmed.attestation(), None);
+    }
+
+    /// Coverage is computed from the ATTESTED BYTES, so an attestation about
+    /// one transaction can never be spent on another's evidence.
+    #[test]
+    fn coverage_is_answered_from_the_attested_bytes() {
+        let input = bare_input(11, false);
+        let h = BindingElement::for_memo(&Memo::from_slice(b"hello world").unwrap()).unwrap();
+        let anchor = crate::memo::anchor::AnchorV1::new(input.nullifier, h);
+
+        // A stand-in "transaction": the nullifier's bytes followed by the
+        // anchor's untagged wire form, exactly as both occur inside a real one.
+        let mut bytes = b"...preamble...".to_vec();
+        bytes.extend_from_slice(&input.nullifier.0.0);
+        bytes.extend_from_slice(&anchor.encode_untagged_bytes());
+        let attestation =
+            SettledAttestation::for_transaction(&bytes, base_crypto::hash::persistent_hash(&bytes))
+                .expect("well formed");
+
+        assert!(attestation.covers_input(input.nullifier));
+        assert!(attestation.covers_anchor(&anchor));
+
+        let other = bare_input(12, false);
+        assert!(!attestation.covers_input(other.nullifier));
+        let other_h =
+            BindingElement::for_memo(&Memo::from_slice(b"another memo").unwrap()).unwrap();
+        assert!(
+            !attestation.covers_anchor(&crate::memo::anchor::AnchorV1::new(
+                input.nullifier,
+                other_h
+            ))
+        );
+
+        let elsewhere = b"a transaction carrying none of this".to_vec();
+        let elsewhere = SettledAttestation::for_transaction(
+            &elsewhere,
+            base_crypto::hash::persistent_hash(&elsewhere),
+        )
+        .expect("well formed");
+        assert!(!elsewhere.covers_input(input.nullifier));
+        assert!(!elsewhere.covers_anchor(&anchor));
+    }
+
+    /// The reserved-zero rule, boundary 3 of 3: no hash preimage, no input and
+    /// no key material are needed to reach the rejection.
+    #[test]
+    fn forced_zero_is_rejected_at_the_verification_boundary() {
+        assert!(admit_companion_row0(Fr::from(0u64)).is_err());
+        assert!(admit_companion_row0(crate::memo::reserved_absence_element()).is_err());
+        for h in [Fr::from(1u64), Fr::from(u64::MAX)] {
+            assert_eq!(admit_companion_row0(h).unwrap().get(), h);
+        }
     }
 }

@@ -293,6 +293,64 @@ impl<D: DB> Output<ProofPreimage, D> {
         Self::new_for_recipient::<R>(rng, coin, segment, Recipient::User(*target_cpk), ciph)
     }
 
+    /// Build the ordinary zero-value output that carries a memo **anchor**
+    /// (project 00003, spend-proof memo binding).
+    ///
+    /// This is a thin, additive convenience over
+    /// [`Output::new_with_ciphertext`] — it changes nothing about how an output
+    /// is constructed, proved or verified. What it does is make the four
+    /// invariants an anchor carrier must satisfy impossible to get wrong:
+    ///
+    /// | Invariant | How it is guaranteed here |
+    /// | --- | --- |
+    /// | the coin is worth **nothing** | `value: 0`, not a parameter |
+    /// | it uses the attributed input's token type | `token_type`, passed in |
+    /// | the nonce is fresh | drawn from `rng` |
+    /// | nobody can ever spend it, **including its creator** | the recipient key pair is generated here and its secret half is dropped before this function returns |
+    ///
+    /// The last row is the one worth dwelling on. The anchor coin is addressed
+    /// to a key that exists for the length of this call and is then gone, so
+    /// there is no secret anywhere that could spend it and no value that could
+    /// be inserted into a wallet's spendable or pending state. An unrelated
+    /// wallet simply fails to decrypt the ciphertext and moves on, exactly as
+    /// it does for any output that is not its own.
+    ///
+    /// The anchor is **strip evidence**, not authentication: it publishes
+    /// `(N, h)` so that a later reader can see a memo commitment existed for
+    /// that input even when the off-chain wrapper is unavailable. Only a
+    /// verified companion proof authenticates memo bytes.
+    ///
+    /// Callers must add this output to the offer BEFORE balancing and proving:
+    /// the output proof binds `ciphertext_to_field(ciphertext)` and the offer's
+    /// Pedersen balance is fixed once proved, so an anchor cannot be grafted
+    /// onto an already-proved transaction.
+    #[instrument(skip(rng))]
+    pub fn new_memo_anchor<R: Rng + CryptoRng>(
+        rng: &mut R,
+        segment: Option<u16>,
+        token_type: coin::ShieldedTokenType,
+        nullifier: coin::Nullifier,
+        binding: &crate::memo::BindingElement,
+    ) -> Result<Self, OfferCreationFailed> {
+        let anchor = crate::memo::anchor::AnchorV1::new(nullifier, *binding);
+
+        // A fresh anchor-only recipient. The SECRET half never leaves this
+        // scope: it is generated, its public key is taken, and it is dropped.
+        let recipient = {
+            let anchor_only_keys: crate::keys::SecretKeys =
+                crate::keys::Seed::random(rng).into();
+            anchor_only_keys.coin_public_key()
+        };
+
+        let coin = CoinInfo {
+            nonce: rng.r#gen(),
+            type_: token_type,
+            value: 0,
+        };
+
+        Self::new_with_ciphertext::<R>(rng, &coin, segment, &recipient, Some(anchor.encode()))
+    }
+
     #[instrument(skip(rng))]
     pub fn new_contract_owned<R: Rng + CryptoRng + ?Sized>(
         rng: &mut R,

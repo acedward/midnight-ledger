@@ -40,6 +40,7 @@ pub mod error;
 pub mod keys;
 pub mod ledger;
 pub mod local;
+pub mod memo;
 pub mod prove;
 mod structure;
 pub mod verify;

@@ -1,0 +1,58 @@
+# INHERITED frozen vectors — project 00001's `memo_to_field` (MemoHashV1).
+#
+# These values were NOT produced by this crate. They are project 00001's own
+# published conformance table, transcribed verbatim. See PROVENANCE.md for the
+# source file, its SHA-256, and what was verified before inheriting.
+#
+# Source table (verbatim):
+#   experiments/00001-zswap-authenticated-memos/midnight-ledger/spec/zswap.md
+#   section "Frozen vectors" — "An implementation is conformant only if it
+#   reproduces all of these. Values are `memo_to_field` output written as 32
+#   little-endian bytes in hex."
+#
+# The derivation they pin:
+#   opening = transient_hash([Fr::from_le_bytes("midnight:zswap-memo[v1]")])
+#   packed  = [Fr(len(m))] ++ 31-byte little-endian chunks, final chunk
+#             zero-padded
+#   h       = transient_commit(packed, opening)
+#
+# DO NOT REGENERATE THIS FILE. `gen_vectors` never writes it — it is evidence
+# from another implementation, and a regeneration would destroy exactly the
+# property it exists to prove. `tests/vectors.rs` replays it.
+#
+# Format: records separated by blank lines; `key: value` lines; `#` comments;
+# byte strings are single-line lowercase hex with no separators; field elements
+# are the 32-byte LITTLE-ENDIAN encoding of `Fr`.
+
+# Absence is NOT a memo. 00001 encoded it as the reserved field element zero in
+# the canonical spend statement — the same value every unmodified node still
+# derives for row 0. It is listed here because it is the first row of 00001's
+# table, and because it is precisely the value `BindingElement` refuses.
+vector: 00001/absent
+absent: true
+memo_hash: 0000000000000000000000000000000000000000000000000000000000000000
+
+vector: 00001/one-zero-byte
+memo_len: 1
+memo: 00
+memo_hash: 731dab59a22ef473b632068c8cd8dfc198f2d9327bfde81cf34b767bd1eee72f
+
+vector: 00001/ascii-19
+memo_len: 19
+memo: 6d69646e69676874206f66666572206d656d6f
+memo_hash: 9c91754b311713226fc113e8aebf987d49405645b8e9c5be2a385ac56cfd8d56
+
+vector: 00001/31x07
+memo_len: 31
+memo: 07070707070707070707070707070707070707070707070707070707070707
+memo_hash: aaa161b051f591f39b2ffbe8362a197bbabadab66a7455530d29b5596a42fe3a
+
+vector: 00001/32x07
+memo_len: 32
+memo: 0707070707070707070707070707070707070707070707070707070707070707
+memo_hash: 86b0785f04932e03e6c069c781a2c2924eeede02e447dc9e3f3af7f2bf355f37
+
+vector: 00001/512xa5
+memo_len: 512
+memo: a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
+memo_hash: 880ded964331c1f45a20a8c6991b9879ac1d776937ded66e608d8d225418e762
