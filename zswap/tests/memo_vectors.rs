@@ -198,6 +198,8 @@ fn every_vector_file_is_present_and_non_trivial() {
         ("memo-hash.txt", 18usize),
         ("anchor.txt", 6),
         ("wrapper.txt", 6),
+        // 00006 Phase 5 (F5): constants + 16 statements + the codec binding.
+        ("statement.txt", 18),
         ("inherited/00001-memo-hash.txt", 6),
         ("inherited/00002-packing.txt", 6),
         ("inherited/00003-phase0-anchor.txt", 1),
@@ -648,5 +650,391 @@ fn frozen_anchors_are_found_by_a_scan_over_surrounding_noise() {
             .expect("frozen anchors are readable ciphertexts");
         assert!(cursor.is_empty());
         assert!(midnight_zswap::memo::anchor::is_anchor_shaped(&ciph));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The COMPLETE SPEND STATEMENT — `statement.txt`.
+//
+// The external toolkit's other three files pin byte layouts. This one pins
+// MEANING: the 68-row public statement a Zswap spend proves against.
+//
+// It is replayed the only way a conformance vector for a derivation can be
+// replayed — by rebuilding a proof-free `Input` from the record's SOURCE PUBLIC
+// FIELDS and re-deriving every row with this crate's own
+// `verify::spend_statement`. Nothing is re-hashed and no frozen row is fed back
+// into the derivation. The two implementations wrote their restatements of
+// `Input::<Proof>::well_formed` separately, so agreement on all 68 rows across
+// {user, contract} x {0, 1, 3, u16::MAX} x row 0 in {0, h} is a real
+// cross-implementation result rather than a copy.
+//
+// `h` is likewise DERIVED here: the `h` records carry memo bytes, this file
+// computes `memo_hash_v1` and checks the answer against the record's `row0`.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "proof-verifying")]
+mod statement {
+    use super::*;
+    use base_crypto::hash::HashOutput;
+    use coin_structure::contract::ContractAddress;
+    use midnight_zswap::Input;
+    use midnight_zswap::verify::{canonical_spend_statement, spend_statement};
+    use storage::arena::Sp;
+    use storage::db::InMemoryDB;
+    use transient_crypto::commitment::Pedersen;
+    use transient_crypto::curve::EmbeddedGroupAffine;
+    use transient_crypto::merkle_tree::MerkleTreeDigest;
+
+    /// Rows in a complete spend statement. `INPUT_PIS` is this crate's own
+    /// constant; the record must agree with it.
+    const STATEMENT_ROWS: usize = 68;
+
+    /// Only the records that describe a statement (skips `statement/constants`
+    /// and the wrapper-binding record).
+    fn statement_records() -> Vec<Record> {
+        parse("statement.txt")
+            .into_iter()
+            .filter(|r| r.maybe("row0_source").is_some())
+            .collect()
+    }
+
+    /// Rebuild the proof-free input a record's source fields describe.
+    ///
+    /// Everything read here is a public field written in the frozen file. A
+    /// proof is not merely unnecessary — carrying one would suggest the
+    /// derivation depended on it.
+    fn input_from(r: &Record) -> Input<(), InMemoryDB> {
+        let raw = r.hex("nullifier");
+        assert_eq!(raw.len(), 32, "{}: nullifier is not 32 bytes", r.name);
+        let mut nullifier_raw = [0u8; 32];
+        nullifier_raw.copy_from_slice(&raw);
+
+        let x = r.field("value_commitment_x");
+        let y = r.field("value_commitment_y");
+        let commitment = EmbeddedGroupAffine::new(x, y)
+            .unwrap_or_else(|| panic!("{}: frozen coordinates are not on the curve", r.name));
+
+        let contract_address = match r.one("contract_address") {
+            "-" => None,
+            hex_addr => {
+                let bytes = unhex(hex_addr);
+                assert_eq!(bytes.len(), 32, "{}: address is not 32 bytes", r.name);
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(&bytes);
+                Some(Sp::new(ContractAddress(HashOutput(addr))))
+            }
+        };
+
+        Input {
+            nullifier: Nullifier(HashOutput(nullifier_raw)),
+            value_commitment: Pedersen(commitment),
+            contract_address,
+            merkle_tree_root: MerkleTreeDigest(r.field("merkle_tree_root")),
+            proof: std::sync::Arc::new(()),
+        }
+    }
+
+    /// The row 0 a record specifies — derived, never read.
+    fn row0_from(r: &Record) -> Fr {
+        match r.one("row0_source") {
+            "zero" => {
+                assert_eq!(r.one("memo"), "-", "{}", r.name);
+                assert_eq!(r.one("memo_len"), "-", "{}", r.name);
+                midnight_zswap::memo::reserved_absence_element()
+            }
+            "memo" => {
+                let bytes = r.hex("memo");
+                assert_eq!(
+                    bytes.len() as u64,
+                    r.num("memo_len"),
+                    "{}: memo_len disagrees with the memo",
+                    r.name
+                );
+                let memo = Memo::from_slice(&bytes).expect("frozen memos are in range");
+                memo_hash_v1(&memo)
+            }
+            other => panic!("{}: unknown row0_source {other:?}", r.name),
+        }
+    }
+
+    fn frozen_rows(r: &Record) -> Vec<Fr> {
+        r.all("row")
+            .iter()
+            .map(|h| {
+                let bytes = unhex(h);
+                assert_eq!(bytes.len(), 32, "{}: a row is not 32 bytes", r.name);
+                Fr::from_le_bytes(&bytes)
+                    .unwrap_or_else(|| panic!("{}: a row is not a canonical Fr", r.name))
+            })
+            .collect()
+    }
+
+    fn rows_sha256(rows: &[Fr]) -> String {
+        let mut bytes = Vec::with_capacity(rows.len() * 32);
+        for row in rows {
+            bytes.extend_from_slice(&fr_le32(*row));
+        }
+        sha256_hex(&bytes)
+    }
+
+    #[test]
+    fn statement_constants_replay() {
+        let records = parse("statement.txt");
+        let r = &records[0];
+        assert_eq!(r.name, "statement/constants");
+        assert_eq!(r.num("statement_rows") as usize, STATEMENT_ROWS);
+        assert_eq!(r.num("statement_tail_rows") as usize, STATEMENT_TAIL_ROWS);
+        // The 12-field Noop that stands in for an absent contract address.
+        // Upstream keeps the same number honest with `test_caddr_op`.
+        assert_eq!(r.num("caddr_op_len"), 12);
+        assert_eq!(r.hex("canonical_row0"), [0u8; 32]);
+        assert_eq!(r.one("reserved_row0_rejected_as"), "ReservedBindingElement");
+        assert!(BindingElement::new(Fr::from(0u64)).is_err());
+    }
+
+    /// The load-bearing replay: every frozen record's 68 rows are re-derived
+    /// from its source fields by THIS crate's restatement of `well_formed`.
+    #[test]
+    fn every_frozen_statement_record_replays_from_its_source_fields() {
+        let mut checked = 0usize;
+        for r in statement_records() {
+            let input = input_from(&r);
+            let segment = u16::try_from(r.num("segment")).expect("segment fits in u16");
+            let row0 = row0_from(&r);
+
+            // The derived `h` (or zero) must be what the record declares.
+            assert_eq!(
+                hexed(&fr_le32(row0)),
+                r.one("row0"),
+                "{}: derived row 0 differs from the frozen one",
+                r.name
+            );
+
+            let derived = spend_statement(&input, segment, row0);
+            assert_eq!(derived.len(), STATEMENT_ROWS, "{}", r.name);
+
+            let frozen = frozen_rows(&r);
+            assert_eq!(
+                frozen.len(),
+                STATEMENT_ROWS,
+                "{}: expected {STATEMENT_ROWS} `row:` lines",
+                r.name
+            );
+            for (i, (mine, theirs)) in derived.iter().zip(frozen.iter()).enumerate() {
+                assert_eq!(
+                    mine, theirs,
+                    "{} row {i} differs from the frozen statement",
+                    r.name
+                );
+            }
+
+            assert_eq!(
+                rows_sha256(&derived),
+                r.one("statement_sha256"),
+                "{} statement_sha256",
+                r.name
+            );
+            assert_eq!(
+                rows_sha256(&derived[1..]),
+                r.one("tail_sha256"),
+                "{} tail_sha256",
+                r.name
+            );
+
+            // The zero records are the statement every unmodified verifier
+            // derives, so the canonical entry point must produce them too.
+            if r.one("row0_source") == "zero" {
+                assert_eq!(
+                    canonical_spend_statement(&input, segment),
+                    derived,
+                    "{}: canonical_spend_statement disagrees",
+                    r.name
+                );
+            }
+
+            match r.one("carrier") {
+                "user" => assert!(input.contract_address.is_none(), "{}", r.name),
+                "contract" => assert!(input.contract_address.is_some(), "{}", r.name),
+                other => panic!("{}: unknown carrier {other:?}", r.name),
+            }
+
+            checked += 1;
+        }
+        assert_eq!(checked, 16, "the frozen statement matrix lost records");
+    }
+
+    /// The file must span the matrix it claims to, asserted against the FILE.
+    #[test]
+    fn the_frozen_statements_cover_the_declared_matrix() {
+        let records = statement_records();
+        for carrier in ["user", "contract"] {
+            for segment in ["0", "1", "3", "65535"] {
+                for row0 in ["zero", "memo"] {
+                    assert!(
+                        records.iter().any(|r| r.one("carrier") == carrier
+                            && r.one("segment") == segment
+                            && r.one("row0_source") == row0),
+                        "no frozen statement for {carrier} / segment {segment} / row0 {row0}"
+                    );
+                }
+            }
+        }
+        let memo_lengths: Vec<u64> = records
+            .iter()
+            .filter(|r| r.one("row0_source") == "memo")
+            .map(|r| r.num("memo_len"))
+            .collect();
+        for boundary in [1u64, 31, 32, 511, 512] {
+            assert!(
+                memo_lengths.contains(&boundary),
+                "no frozen statement carries a {boundary}-byte memo"
+            );
+        }
+    }
+
+    /// Row 0 is the only place a memo can enter a spend statement. The frozen
+    /// pairs make that measurable rather than argued.
+    #[test]
+    fn frozen_statement_pairs_differ_only_in_row_zero() {
+        let records = statement_records();
+        let mut pairs = 0usize;
+        for pair in records.chunks(2) {
+            let [zero, h] = pair else {
+                panic!("statement records must be frozen in zero/h pairs")
+            };
+            assert_eq!(zero.one("row0_source"), "zero", "{}", zero.name);
+            assert_eq!(h.one("row0_source"), "memo", "{}", h.name);
+            for key in [
+                "carrier",
+                "nullifier",
+                "merkle_tree_root",
+                "value_commitment_x",
+                "value_commitment_y",
+                "contract_address",
+                "segment",
+            ] {
+                assert_eq!(
+                    zero.one(key),
+                    h.one(key),
+                    "{} and {} disagree about {key}",
+                    zero.name,
+                    h.name
+                );
+            }
+            let zero_rows = frozen_rows(zero);
+            let h_rows = frozen_rows(h);
+            assert_eq!(zero_rows[1..], h_rows[1..], "{} vs {}", zero.name, h.name);
+            assert_ne!(zero_rows[0], h_rows[0]);
+            assert_eq!(zero_rows[0], Fr::from(0u64));
+            assert_eq!(zero.one("tail_sha256"), h.one("tail_sha256"));
+            pairs += 1;
+        }
+        assert_eq!(pairs, 8);
+    }
+
+    /// Cross-file: an `h` record's row 0 must equal `memo-hash.txt`'s answer for
+    /// the same memo bytes, so the two frozen layers cannot drift apart.
+    #[test]
+    fn frozen_statement_row0_agrees_with_the_frozen_memo_hash_table() {
+        let memo_records = parse("memo-hash.txt");
+        let mut matched = 0usize;
+        for r in statement_records() {
+            if r.one("row0_source") != "memo" {
+                continue;
+            }
+            let memo_hex = r.one("memo");
+            let m = memo_records
+                .iter()
+                .find(|m| m.maybe("memo") == Some(memo_hex))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: its memo has no record in memo-hash.txt — the two \
+                         files must share their memo shapes",
+                        r.name
+                    )
+                });
+            assert_eq!(
+                r.one("row0"),
+                m.one("memo_hash"),
+                "{}: row 0 disagrees with memo-hash.txt record {}",
+                r.name,
+                m.name
+            );
+            matched += 1;
+        }
+        assert_eq!(matched, 8);
+    }
+
+    /// The codec/semantic binding record: a real wrapper container whose
+    /// statement section is a REAL derived statement tail, not the generated
+    /// stand-in `wrapper.txt` freezes. An implementation that agreed about the
+    /// container and disagreed about the statement fails right here.
+    #[test]
+    fn the_wrapper_binding_record_ties_the_codec_to_the_statement() {
+        let records = parse("statement.txt");
+        let r = records
+            .iter()
+            .find(|r| r.name == "statement/wrapper-binding")
+            .expect("the binding record is present");
+        let target = r.one("binds_statement");
+        let semantic = records
+            .iter()
+            .find(|s| s.name == target)
+            .unwrap_or_else(|| panic!("binds_statement names a missing record: {target}"));
+        assert_eq!(semantic.one("row0_source"), "memo");
+
+        let encoded = r.hex("encoded");
+        assert_eq!(encoded.len() as u64, r.num("encoded_len"));
+        assert_eq!(sha256_hex(&encoded), r.one("encoded_sha256"));
+
+        let w = MemoWrapperV1::decode(&encoded)
+            .unwrap_or_else(|e| panic!("the binding wrapper did not decode: {e}"));
+
+        assert_eq!(hexed(&w.nullifier().0.0), semantic.one("nullifier"));
+        assert_eq!(w.segment().to_string(), semantic.one("segment"));
+        assert_eq!(hexed(w.unverified_memo().as_bytes()), semantic.one("memo"));
+        assert_eq!(
+            hexed(&fr_le32(memo_hash_v1(w.unverified_memo()))),
+            semantic.one("row0"),
+            "the binding wrapper's memo must hash to the semantic record's row 0"
+        );
+
+        // The tail must be the DERIVED statement's rows 1..68 — derived here
+        // from the semantic record's source fields, not copied from either
+        // record.
+        let input = input_from(semantic);
+        let segment = u16::try_from(semantic.num("segment")).expect("segment fits in u16");
+        let derived = spend_statement(&input, segment, row0_from(semantic));
+        assert_eq!(
+            w.claimed_statement_tail(),
+            &derived[1..],
+            "the binding wrapper does not carry the derived statement tail"
+        );
+        assert_eq!(
+            w.claimed_statement_tail().len() as u64,
+            r.num("statement_rows")
+        );
+        assert_eq!(
+            rows_sha256(w.claimed_statement_tail()),
+            r.one("statement_sha256")
+        );
+        assert_eq!(
+            r.one("statement_sha256"),
+            semantic.one("tail_sha256"),
+            "the binding record's tail digest must be the semantic record's"
+        );
+
+        assert_eq!(w.companion_proof_bytes().len() as u64, r.num("proof_len"));
+        assert_eq!(sha256_hex(w.companion_proof_bytes()), r.one("proof_sha256"));
+        let locator = w.locator().expect("the binding wrapper carries a locator");
+        assert_eq!(hexed(locator.as_untrusted_bytes()), r.one("locator"));
+        assert_eq!(
+            locator.as_untrusted_bytes().len() as u64,
+            r.num("locator_len")
+        );
+
+        // ...and it re-encodes identically, which is what makes it a codec
+        // record as well as a semantic one.
+        assert_eq!(w.encode(), encoded);
     }
 }

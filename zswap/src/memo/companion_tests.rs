@@ -705,3 +705,197 @@ fn the_memo_hash_is_the_frozen_value() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// PROJECT 00006 PHASE 5 (finding F5) — WIDENING THE PROOF-BASED REFEREE.
+//
+// `the_restated_statement_agrees_with_the_shipped_verifier` above is the
+// strongest guard `verify::spend_statement` has: a statement that differed from
+// `Input::<Proof>::well_formed`'s by a single row would not verify a REAL
+// canonical proof, so the shipped `SPEND_VK` referees the restatement for us.
+// Until now it refereed exactly one shape — a user-owned input at segment 3.
+//
+// The statement assembly has two branches the shipped key can referee and did
+// not: the CONTRACT-OWNED arm, where a `Cell_write` of the address replaces the
+// 12-field `Noop`, and the `u16::MAX` segment at the top of the segment field's
+// range. `statement.txt` freezes both arms, but a frozen vector only proves the
+// two implementations agree with each other; only a real proof proves they
+// agree with the circuit. These two tests close that gap with the existing
+// `SPEND_VK` material and no new circuits.
+//
+// A contract-owned input is an INELIGIBLE memo carrier (spec 00003 FR-015) and
+// `verify_memo_companion` refuses it, so the contract test deliberately makes
+// no companion: it is drift insurance for the statement layout, not a memo
+// flow.
+// ---------------------------------------------------------------------------
+
+/// The restated statement agrees with the shipped verifier on the
+/// CONTRACT-OWNED arm — the branch that writes the address instead of the
+/// 12-field `Noop`.
+#[tokio::test]
+async fn the_restated_statement_agrees_with_the_shipped_verifier_for_a_contract_owned_input() {
+    use coin_structure::contract::ContractAddress;
+    use coin_structure::transfer::Recipient;
+    use transient_crypto::merkle_tree::MerkleTree;
+
+    let mut rng = StdRng::seed_from_u64(0x0000_03C0_1150);
+    let resolver = resolver();
+    let mut provider = LocalProvingProvider {
+        rng: rng.split(),
+        params: &resolver,
+        resolver: &resolver,
+    };
+
+    let address = ContractAddress(rng.r#gen());
+    let coin = CoinInfo {
+        nonce: rng.r#gen(),
+        type_: ShieldedTokenType(rng.r#gen()),
+        value: 7_777,
+    };
+    let tree = MerkleTree::<(), InMemoryDB>::blank(crate::ZSWAP_TREE_HEIGHT)
+        .try_update_hash(0, coin.commitment(&Recipient::Contract(address)).0, ())
+        .expect("seeding the contract-owned tree")
+        .rehash();
+    let input: Input<ProofPreimage, InMemoryDB> =
+        Input::new_contract_owned(&mut rng, &coin.qualify(0), Some(SEGMENT), address, &tree)
+            .expect("building a contract-owned input");
+    assert!(
+        input.contract_address.is_some(),
+        "the fixture must be on the contract arm"
+    );
+
+    let offer = Offer::new(vec![input.clone()], Vec::new(), Vec::new())
+        .expect("a non-empty contract-owned offer");
+    let (_, proven) = offer
+        .prove(provider.split(), SEGMENT)
+        .await
+        .expect("the contract-owned offer must prove");
+    let settled = proven
+        .inputs
+        .iter_deref()
+        .find(|i| i.nullifier == input.nullifier)
+        .cloned()
+        .expect("the contract-owned input survived proving");
+
+    // The consensus entry point accepts it...
+    settled
+        .well_formed(SEGMENT)
+        .expect("a contract-owned input must be well formed");
+
+    // ...and so does the restated statement, row for row.
+    let canonical = canonical_spend_statement(&settled, SEGMENT);
+    assert_eq!(canonical[0], Fr::from(0u64));
+    verify_detached_spend_proof(&settled.proof, &canonical)
+        .expect("the contract-owned proof must verify against the restated statement");
+
+    // The mirror control: row 0 really is binding, on this arm too.
+    let memo = Memo::from_slice(MEMO).expect("the test memo is in range");
+    let binding = BindingElement::for_memo(&memo).expect("a real memo hash is nonzero");
+    assert!(
+        verify_detached_spend_proof(
+            &settled.proof,
+            &spend_statement(&settled, SEGMENT, binding.get())
+        )
+        .is_err(),
+        "a canonical proof must not verify with a nonzero row 0"
+    );
+
+    // And the arm is genuinely different from the user arm: a statement built
+    // for the same input WITHOUT the address must not verify the proof.
+    let user_shaped = Input::<Proof, InMemoryDB> {
+        contract_address: None,
+        ..settled.clone()
+    };
+    assert!(
+        verify_detached_spend_proof(
+            &settled.proof,
+            &canonical_spend_statement(&user_shaped, SEGMENT)
+        )
+        .is_err(),
+        "the contract-address ops must be part of the statement the proof binds"
+    );
+}
+
+/// The restated statement agrees with the shipped verifier at the TOP of the
+/// segment range, and a companion still proves `h` and not zero there.
+#[tokio::test]
+async fn the_restated_statement_agrees_with_the_shipped_verifier_at_the_max_segment() {
+    const MAX_SEGMENT: u16 = u16::MAX;
+
+    let mut rng = StdRng::seed_from_u64(0x0000_03C0_1151);
+    let resolver = resolver();
+    let mut provider = LocalProvingProvider {
+        rng: rng.split(),
+        params: &resolver,
+        resolver: &resolver,
+    };
+
+    let secret_keys: SecretKeys = Seed::random(&mut rng).into();
+    let coin = CoinInfo {
+        nonce: rng.r#gen(),
+        type_: ShieldedTokenType(rng.r#gen()),
+        value: 4_242,
+    };
+    let state: local::State<InMemoryDB> = local::State::new()
+        .insert_coin(&secret_keys, coin)
+        .expect("inserting the carrier coin");
+    let (_after, input) = state
+        .spend(&mut rng, &secret_keys, &coin.qualify(0), Some(MAX_SEGMENT))
+        .expect("spending the carrier coin at the maximum segment");
+
+    let memo = Memo::from_slice(MEMO).expect("the test memo is in range");
+    let binding = BindingElement::for_memo(&memo).expect("a real memo hash is nonzero");
+
+    let companion = input
+        .prove_memo_companion(provider.split(), &binding, MAX_SEGMENT)
+        .await
+        .expect("the companion must prove at the maximum segment");
+
+    let offer = Offer::new(vec![input.clone()], Vec::new(), Vec::new()).expect("a non-empty offer");
+    let (_, proven) = offer
+        .prove(provider.split(), MAX_SEGMENT)
+        .await
+        .expect("the canonical offer must prove at the maximum segment");
+    let settled = proven
+        .inputs
+        .iter_deref()
+        .find(|i| i.nullifier == input.nullifier)
+        .cloned()
+        .expect("the carrier survived proving");
+
+    settled
+        .well_formed(MAX_SEGMENT)
+        .expect("the canonical input must be well formed at the maximum segment");
+
+    let canonical = canonical_spend_statement(&settled, MAX_SEGMENT);
+    verify_detached_spend_proof(&settled.proof, &canonical)
+        .expect("the canonical proof must verify against the restated statement");
+
+    // The companion arm at the same segment: `h`, not zero.
+    let bytes = companion
+        .detached_proof_bytes()
+        .expect("the companion serializes");
+    let mut cursor = &bytes[..];
+    let companion_proof: Proof = tagged_deserialize(&mut cursor).expect("round-trip");
+    assert!(cursor.is_empty());
+
+    let companion_statement = spend_statement(&settled, MAX_SEGMENT, binding.get());
+    assert_eq!(companion.statement(), companion_statement);
+    verify_detached_spend_proof(&companion_proof, &companion_statement)
+        .expect("the companion must verify at row 0 = h at the maximum segment");
+    assert!(
+        verify_detached_spend_proof(&companion_proof, &canonical).is_err(),
+        "the companion must not verify at row 0 = 0"
+    );
+
+    // The segment is genuinely in the statement: the same proof must not verify
+    // against a statement built at a different one.
+    assert!(
+        verify_detached_spend_proof(
+            &settled.proof,
+            &canonical_spend_statement(&settled, MAX_SEGMENT - 1)
+        )
+        .is_err(),
+        "the segment must be part of the statement the proof binds"
+    );
+}
