@@ -53,11 +53,27 @@ use crate::structure::{
     INPUT_PROOF_SIZE, Input, MemoCompanion, OUTPUT_PROOF_SIZE, Offer, Output, ZSWAP_EXPECTED_FILES,
 };
 use crate::verify::{
-    canonical_spend_statement, spend_statement, verify_detached_spend_proof, verify_memo_companion,
+    Confirmation, canonical_spend_statement, spend_statement, verify_detached_spend_proof,
+    verify_memo_companion,
 };
 
 const SEGMENT: u16 = 3;
 const MEMO: &[u8] = b"hello world";
+
+/// A settlement attestation for a LOCALLY PROVEN offer (00006 finding F3).
+///
+/// These tests prove and verify inside one process: there is no chain and no
+/// settled transaction, so the honest thing to attest to is the offer's own
+/// canonical bytes — and this helper's name says so. The evidence boundary is
+/// still exercised for real: `Confirmation::settled` recomputes the hash, and
+/// `verify_memo_companion` still requires the attested bytes to spend the
+/// attributed input and publish the wrapper's `(N, h)`.
+fn stand_in_attestation(offer: &Offer<Proof, InMemoryDB>) -> Confirmation {
+    let mut bytes = Vec::new();
+    serialize::tagged_serialize(offer, &mut bytes).expect("serializing an offer cannot fail");
+    Confirmation::settled(&bytes, base_crypto::hash::persistent_hash(&bytes))
+        .expect("a self-consistent attestation")
+}
 
 fn resolver() -> ZswapResolver {
     ZswapResolver(
@@ -330,7 +346,7 @@ async fn the_anchor_output_is_an_ordinary_output_the_shipped_path_accepts() {
     assert_eq!(sightings[0].anchor, decoded);
 }
 
-/// Two anchors for the same `(N, h)` are independent coins, so a settled anchor
+/// Two anchors for the same `(N, h)` are independent coins, so an anchor
 /// cannot be recognised by its commitment.
 #[tokio::test]
 async fn two_anchors_for_one_pair_have_distinct_commitments() {
@@ -375,14 +391,33 @@ async fn a_real_wrapper_authenticates_against_the_proven_offer() {
     let parsed = MemoWrapperV1::decode(&encoded).expect("the wrapper round-trips");
     assert_eq!(parsed.encode(), encoded);
 
-    let record = verify_memo_companion(&parsed, &built.proven, SEGMENT)
-        .expect("a real wrapper must authenticate");
+    let record = verify_memo_companion(
+        &parsed,
+        &built.proven,
+        SEGMENT,
+        &stand_in_attestation(&built.proven),
+    )
+    .expect("a real wrapper must authenticate");
     assert_eq!(record.authenticated_memo().as_bytes(), MEMO);
     assert_eq!(record.nullifier(), built.input.nullifier);
     assert_eq!(record.segment(), SEGMENT);
     assert_eq!(record.binding(), built.binding);
-    assert!(record.is_anchored());
+    assert!(record.has_matching_anchor());
+    assert!(
+        record.is_settled_anchored(),
+        "the attestation covers this memo"
+    );
+    assert!(record.attested_transaction().is_some());
     assert!(!record.has_duplicate_anchors());
+
+    // The SAME wrapper with no settlement asserted authenticates just as well
+    // and claims no settlement at all (00006 finding F3, spec FR-103).
+    let unattested =
+        verify_memo_companion(&parsed, &built.proven, SEGMENT, &Confirmation::Unconfirmed)
+            .expect("authentication does not depend on settlement evidence");
+    assert!(unattested.has_matching_anchor());
+    assert!(!unattested.is_settled_anchored());
+    assert_eq!(unattested.attested_transaction(), None);
     assert_eq!(record.matching_anchors().len(), 1);
 
     // The bech32m rendering is a rendering: it round-trips to the same bytes.
@@ -391,7 +426,7 @@ async fn a_real_wrapper_authenticates_against_the_proven_offer() {
     assert_eq!(crate::memo::bech32m::decode(&rendered).unwrap(), encoded);
 }
 
-/// The tamper matrix, against a real proof and a real settled offer. Every case
+/// The tamper matrix, against a real proof and a real proven offer. Every case
 /// must fail closed with its own diagnosis.
 #[tokio::test]
 async fn the_tamper_matrix_fails_closed() {
@@ -425,7 +460,7 @@ async fn the_tamper_matrix_fails_closed() {
         let w = rebuild(memo, built.input.nullifier, SEGMENT, tail.clone());
         assert!(
             matches!(
-                verify_memo_companion(&w, &built.proven, SEGMENT),
+                verify_memo_companion(&w, &built.proven, SEGMENT, &Confirmation::Unconfirmed),
                 Err(MemoVerifyError::CompanionProofRejected { .. })
             ),
             "a tampered memo authenticated: {memo:02x?}"
@@ -440,14 +475,14 @@ async fn the_tamper_matrix_fails_closed() {
         tail.clone(),
     );
     assert!(matches!(
-        verify_memo_companion(&w, &built.proven, SEGMENT),
+        verify_memo_companion(&w, &built.proven, SEGMENT, &Confirmation::Unconfirmed),
         Err(MemoVerifyError::AttributedInputNotFound { .. })
     ));
 
     // 3. a segment that is not the settled one.
     let w = rebuild(MEMO, built.input.nullifier, SEGMENT + 1, tail.clone());
     assert!(matches!(
-        verify_memo_companion(&w, &built.proven, SEGMENT),
+        verify_memo_companion(&w, &built.proven, SEGMENT, &Confirmation::Unconfirmed),
         Err(MemoVerifyError::SegmentMismatch { .. })
     ));
 
@@ -456,7 +491,7 @@ async fn the_tamper_matrix_fails_closed() {
     let mut bad_tail = tail.clone();
     bad_tail[12] = bad_tail[12] + Fr::from(1u64);
     let w = rebuild(MEMO, built.input.nullifier, SEGMENT, bad_tail);
-    match verify_memo_companion(&w, &built.proven, SEGMENT) {
+    match verify_memo_companion(&w, &built.proven, SEGMENT, &Confirmation::Unconfirmed) {
         Err(MemoVerifyError::StatementRowMismatch { row }) => assert_eq!(row, 13),
         other => panic!("a perturbed statement row was not caught: {other:?}"),
     }
@@ -475,7 +510,7 @@ async fn the_tamper_matrix_fails_closed() {
     )
     .unwrap();
     assert!(matches!(
-        verify_memo_companion(&w, &built.proven, SEGMENT),
+        verify_memo_companion(&w, &built.proven, SEGMENT, &Confirmation::Unconfirmed),
         Err(MemoVerifyError::CompanionProofRejected { .. })
     ));
 
@@ -490,13 +525,19 @@ async fn the_tamper_matrix_fails_closed() {
     )
     .unwrap();
     assert!(matches!(
-        verify_memo_companion(&w, &built.proven, SEGMENT),
+        verify_memo_companion(&w, &built.proven, SEGMENT, &Confirmation::Unconfirmed),
         Err(MemoVerifyError::MalformedCompanionProof { .. })
     ));
 
     // ...and the untouched wrapper still authenticates, so none of the above
     // passed for an unrelated reason.
-    verify_memo_companion(&good, &built.proven, SEGMENT).expect("control");
+    verify_memo_companion(
+        &good,
+        &built.proven,
+        SEGMENT,
+        &stand_in_attestation(&built.proven),
+    )
+    .expect("control");
 }
 
 /// An authenticated memo without a matching anchor is a WEAKER state, not a
@@ -537,10 +578,47 @@ async fn a_companion_without_a_matching_anchor_is_unanchored_not_rejected() {
 
     assert!(proven.memo_anchors().is_empty());
     let w = MemoWrapperV1::build(Memo::from_slice(MEMO).unwrap(), &companion, None).unwrap();
-    let record = verify_memo_companion(&w, &proven, SEGMENT)
+    let record = verify_memo_companion(&w, &proven, SEGMENT, &stand_in_attestation(&proven))
         .expect("the companion still authenticates the memo");
-    assert!(!record.is_anchored());
+    assert!(!record.has_matching_anchor());
+    assert!(
+        !record.is_settled_anchored(),
+        "no anchor, so nothing to settle"
+    );
     assert_eq!(record.authenticated_memo().as_bytes(), MEMO);
+}
+
+/// The carrier is resolved BY VALUE, and a duplicated nullifier is REFUSED
+/// rather than silently disambiguated by position (00006 finding F3: this
+/// lookup used to be a `.find()`).
+#[tokio::test]
+async fn a_duplicated_attributed_input_is_refused_rather_than_picked() {
+    let mut rng = StdRng::seed_from_u64(0x0000_03C0_1F03);
+    let built = build(&mut rng).await;
+    let w = wrapper(&built);
+
+    let mut inputs: Vec<Input<Proof, InMemoryDB>> =
+        built.proven.inputs.iter_deref().cloned().collect();
+    let carrier = inputs
+        .iter()
+        .find(|i| i.nullifier == w.nullifier())
+        .cloned()
+        .expect("the carrier is in the proven offer");
+    inputs.push(carrier);
+    let doubled = Offer {
+        inputs: inputs.into(),
+        outputs: built.proven.outputs.clone(),
+        transient: built.proven.transient.clone(),
+        deltas: built.proven.deltas.clone(),
+    };
+
+    match verify_memo_companion(&w, &doubled, SEGMENT, &Confirmation::Unconfirmed) {
+        Err(MemoVerifyError::DuplicateAttributedInput { nullifier, count }) => {
+            assert_eq!(nullifier, w.nullifier());
+            assert_eq!(count, 2);
+        }
+        other => panic!("expected a duplicate-carrier refusal, got {other:?}"),
+    }
 }
 
 /// The construction gate: a contract-owned carrier never reaches the prover.

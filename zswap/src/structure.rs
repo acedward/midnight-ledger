@@ -750,11 +750,13 @@ impl Debug for MemoCompanion {
     }
 }
 
-/// One valid `AnchorV1` found on a settled output.
+/// One valid `AnchorV1` found on an output of the offer that was scanned.
 ///
-/// A reference, not a judgement: a settled anchor is **strip evidence** that a
-/// memo commitment was published for that nullifier. It authenticates nothing
-/// on its own.
+/// A reference, not a judgement: an anchor is **strip evidence** that a memo
+/// commitment was published in the offer it was found in. It authenticates
+/// nothing on its own, and its presence says nothing about whether the
+/// transaction carrying it settled — that is a separate, caller-attested
+/// question ([`crate::verify::SettledAttestation`], 00006 finding F3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoAnchorRef {
     /// Where the carrying output sits in the offer's (sorted) output array.
@@ -801,8 +803,10 @@ impl<P: Storable<D>, D: DB> Offer<P, D> {
 /// statement rebuilt from the canonical input, so holding one of these means
 /// the memo bytes really were authorized by whoever could spend that input.
 ///
-/// It still does not mean the memo is *true*, that it was delivered, or that a
-/// missing wrapper was deliberately withheld.
+/// It still does not mean the memo is *true*, that it was delivered, that a
+/// missing wrapper was deliberately withheld, or that anything settled: the
+/// settlement column is whatever the caller attested
+/// ([`crate::verify::Confirmation`]) and nothing more.
 #[derive(Debug, Clone)]
 pub struct MemoVerification {
     memo: crate::memo::Memo,
@@ -810,6 +814,7 @@ pub struct MemoVerification {
     segment: u16,
     binding: crate::memo::BindingElement,
     anchors: Vec<MemoAnchorRef>,
+    attested_tx_hash: Option<base_crypto::hash::HashOutput>,
 }
 
 impl MemoVerification {
@@ -819,6 +824,7 @@ impl MemoVerification {
         segment: u16,
         binding: crate::memo::BindingElement,
         anchors: Vec<MemoAnchorRef>,
+        attested_tx_hash: Option<base_crypto::hash::HashOutput>,
     ) -> Self {
         MemoVerification {
             memo,
@@ -826,6 +832,7 @@ impl MemoVerification {
             segment,
             binding,
             anchors,
+            attested_tx_hash,
         }
     }
 
@@ -841,7 +848,7 @@ impl MemoVerification {
         self.nullifier
     }
 
-    /// The settled segment the statement was rebuilt at.
+    /// The canonical segment the statement was rebuilt at.
     #[inline]
     pub fn segment(&self) -> u16 {
         self.segment
@@ -853,20 +860,46 @@ impl MemoVerification {
         self.binding
     }
 
-    /// Settled anchors whose decoded `(N, h)` match this record exactly.
+    /// Anchors of the offer that was checked whose decoded `(N, h)` match this
+    /// record exactly.
     ///
     /// Empty means the companion authenticated the memo but no matching anchor
     /// was found in the offer that was checked — which is a weaker state, not a
-    /// failure.
+    /// failure. A non-empty list means the commitment was published in that
+    /// offer; whether the transaction carrying it settled is
+    /// [`MemoVerification::attested_transaction`]'s question, not this one.
     #[inline]
     pub fn matching_anchors(&self) -> &[MemoAnchorRef] {
         &self.anchors
     }
 
-    /// Whether at least one settled anchor matched.
+    /// Whether at least one matching anchor is present in the offer that was
+    /// checked. **Publication, not settlement** (00006 finding F3).
     #[inline]
-    pub fn is_anchored(&self) -> bool {
+    pub fn has_matching_anchor(&self) -> bool {
         !self.anchors.is_empty()
+    }
+
+    /// The transaction the caller attested settled, when that attestation
+    /// really does spend this input and publish this `(N, h)`.
+    ///
+    /// `None` whenever settlement was not asserted, or was asserted for some
+    /// other transaction. It is a caller assertion either way — this crate
+    /// never observes a chain.
+    #[inline]
+    pub fn attested_transaction(&self) -> Option<base_crypto::hash::HashOutput> {
+        self.attested_tx_hash
+    }
+
+    /// Whether a matching anchor is present **and** the caller attested that
+    /// the transaction carrying it settled.
+    ///
+    /// This is the strongest state this API reports, and it is exactly as
+    /// strong as the caller's attestation — see
+    /// [`crate::verify::SettledAttestation`].
+    #[inline]
+    pub fn is_settled_anchored(&self) -> bool {
+        self.attested_tx_hash.is_some() && !self.anchors.is_empty()
     }
 
     /// Whether more than one matching anchor was present.

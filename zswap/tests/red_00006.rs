@@ -51,7 +51,7 @@ use midnight_zswap::local;
 use midnight_zswap::memo::wrapper::MemoWrapperV1;
 use midnight_zswap::memo::{BindingElement, Memo};
 use midnight_zswap::prove::ZswapResolver;
-use midnight_zswap::verify::verify_memo_companion;
+use midnight_zswap::verify::{Confirmation, verify_memo_companion};
 use midnight_zswap::{INPUT_PROOF_SIZE, Input, Offer, Output, ZSWAP_EXPECTED_FILES};
 
 const SEGMENT: u16 = 3;
@@ -372,13 +372,17 @@ async fn f2_fork_wrapper_build_accepts_a_memo_that_does_not_hash_to_the_binding(
 // fact (`structure.rs:753`, `:807-881`: "settled anchors", "one valid AnchorV1
 // found on a settled output").
 //
-// Desired (spec FR-103): the same evidence boundary the toolkit gets. Today:
-// a purely local offer, assembled in this process seconds ago, yields
-// `is_anchored() == true` and accessors that call its anchors settled.
+// GREEN since 00006 Phase 3: `verify_memo_companion` takes a `&Confirmation`,
+// `MemoVerification` distinguishes `has_matching_anchor()` (publication in the
+// offer that was checked) from `is_settled_anchored()` (publication PLUS a
+// caller attestation bound to the transaction carrying it), and no accessor or
+// doc calls an unattested anchor settled.
 // ===========================================================================
 
+// GREEN since 00006 Phase 3. It stays in the DEFAULT group: the fork's own
+// `memo/companion_tests.rs` already proves with real key material in the
+// default suite, so this test adds no new runner requirement.
 #[tokio::test]
-#[ignore = "RED until 00006 Phase 3 (F3) — [real prover]"]
 async fn f3_fork_verify_memo_companion_calls_a_never_on_chain_anchor_settled() {
     let mut rng = StdRng::seed_from_u64(0x0000_06F0_0301);
     let f = fixture(&mut rng, SEGMENT, MEMO_A);
@@ -419,17 +423,34 @@ async fn f3_fork_verify_memo_companion_calls_a_never_on_chain_anchor_settled() {
     .expect("the wrapper must build");
 
     // NOTHING here has been near a chain: `proven` was assembled and proved in
-    // this process moments ago, and `verify_memo_companion` has no parameter
-    // through which a caller could even claim otherwise.
+    // this process moments ago. The signature now has a place to say so, and
+    // the honest thing a caller in this position can say is `Unconfirmed`.
     let verification =
-        verify_memo_companion(&wrapper, &proven, SEGMENT).expect("verification succeeds today");
+        verify_memo_companion(&wrapper, &proven, SEGMENT, &Confirmation::Unconfirmed)
+            .expect("authentication does not depend on settlement evidence");
 
     assert!(
-        !verification.is_anchored(),
-        "F3 RED: `verify_memo_companion` reported {} matching anchor(s) as SETTLED strip \
-         evidence for an offer that was never broadcast, and its signature has no place \
-         to supply settlement evidence at all. Spec FR-103 requires the same typed, \
+        !verification.is_settled_anchored(),
+        "F3: `verify_memo_companion` reported {} matching anchor(s) as SETTLED strip \
+         evidence for an offer that was never broadcast. Spec FR-103 requires the typed, \
          transaction-bound evidence boundary the toolkit gets.",
         verification.matching_anchors().len()
     );
+    assert_eq!(verification.attested_transaction(), None);
+    // The anchor IS present in the offer that was checked — publication is not
+    // settlement, and the API now distinguishes them.
+    assert!(verification.has_matching_anchor());
+
+    // An attestation for some OTHER transaction must not promote it either.
+    let elsewhere = b"a real, public, settled transaction that carries none of this".to_vec();
+    let confirmation =
+        Confirmation::settled(&elsewhere, base_crypto::hash::persistent_hash(&elsewhere))
+            .expect("a self-consistent attestation");
+    let verification = verify_memo_companion(&wrapper, &proven, SEGMENT, &confirmation)
+        .expect("authentication is unaffected");
+    assert!(
+        !verification.is_settled_anchored(),
+        "F3: an attestation bound to another transaction must not settle this memo"
+    );
+    assert_eq!(verification.attested_transaction(), None);
 }
