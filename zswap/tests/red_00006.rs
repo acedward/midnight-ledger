@@ -200,7 +200,6 @@ impl ProvingProvider for StandInProver {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "RED until 00006 Phase 1 (F1) — [real prover]"]
 async fn f1_fork_prove_memo_companion_returns_a_silent_row_zero_companion() {
     let mut rng = StdRng::seed_from_u64(0x0000_06F0_0F01);
     let f = fixture(&mut rng, SEGMENT, MEMO_A);
@@ -219,7 +218,18 @@ async fn f1_fork_prove_memo_companion_returns_a_silent_row_zero_companion() {
         .await;
 
     match result {
-        Err(_) => { /* the post-remediation behaviour */ }
+        // GREEN since 00006 Phase 1: the refusal must carry the SPECIFIC
+        // diagnosis, not merely "some error". A backend that discards the
+        // override also fails the row-0-`h` test, so a producer that asked the
+        // two questions in the wrong order would still return `Err` while losing
+        // the diagnosis; this asserts the order too.
+        Err(midnight_zswap::memo::MemoCompanionError::SilentRowZeroProof) => {}
+        Err(other) => panic!(
+            "F1: `Input::prove_memo_companion` refused the SilentRowZeroProver backend, \
+             but with {other:?} instead of MemoCompanionError::SilentRowZeroProof. Spec \
+             FR-101 requires the row-0-ZERO question to be asked first so this exact \
+             diagnosis survives."
+        ),
         Ok(companion) => {
             // Show WHY this is the defect, with the crate's own verifier: the
             // returned companion verifies with row 0 = 0 and fails at row 0 = h.
