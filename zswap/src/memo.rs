@@ -36,7 +36,10 @@
 //! A reader verifies the companion proof under the **shipped** `SPEND_VK` with
 //! statement row 0 replaced by `h`
 //! ([`crate::verify::verify_memo_companion`]) and matches it against the
-//! settled anchor by decoded `(N, h)`.
+//! offer's anchors by decoded `(N, h)`. Whether the transaction carrying that
+//! offer settled is a separate, caller-attested question
+//! ([`crate::verify::Confirmation`]) — presence of an anchor is publication,
+//! never settlement.
 //!
 //! # What this is NOT
 //!
@@ -51,7 +54,7 @@
 //!   the *existing* `CoinCiphertext` slot of an ordinary output, and the
 //!   companion proof is produced by the *existing* `overwrite_binding_input`
 //!   hook of [`transient_crypto::proofs::ProvingProvider`].
-//! * A settled anchor alone authenticates nothing. It is **strip evidence**:
+//! * An anchor alone authenticates nothing. It is **strip evidence**:
 //!   it shows that a memo commitment was published for that nullifier, not who
 //!   wrote the memo, what it said, or whether a wrapper was deliberately
 //!   withheld. Only a verified companion proof authenticates memo bytes.
@@ -473,6 +476,17 @@ pub enum MemoVerifyError {
         /// The underlying message, verbatim.
         reason: String,
     },
+    /// The offer carries the wrapper's nullifier more than once, so there is no
+    /// single attributed input to rebuild the statement from.
+    ///
+    /// Added by 00006 (review finding F3): the carrier used to be resolved with
+    /// `.find()`, which silently picked the first match.
+    DuplicateAttributedInput {
+        /// The repeated nullifier.
+        nullifier: coin_structure::coin::Nullifier,
+        /// How many inputs carried it.
+        count: usize,
+    },
 }
 
 impl Display for MemoVerifyError {
@@ -509,6 +523,12 @@ impl Display for MemoVerifyError {
             MemoVerifyError::CompanionProofRejected { reason } => {
                 write!(f, "companion proof does not bind this memo: {reason}")
             }
+            MemoVerifyError::DuplicateAttributedInput { nullifier, count } => write!(
+                f,
+                "this offer carries nullifier {} {count} times; there is no single \
+                 attributed input",
+                hex_lower(&nullifier.0.0)
+            ),
         }
     }
 }
