@@ -1609,6 +1609,70 @@ impl<D: DB> DustLocalState<D> {
         })
     }
 
+    /// Cuts a collapsed update covering `[generation_index_start, generation_index_end]`
+    /// (inclusive) out of this state's generating tree.
+    ///
+    /// This is the local-state counterpart of building the update from the
+    /// chain-side `DustGenerationState.generating_tree`: a party that holds a
+    /// [`DustLocalState`] mirroring the chain's generating tree can hand another
+    /// party the aligned subtree hashes for a range it does not need to see leaf
+    /// by leaf, which that party then feeds to
+    /// [`DustLocalState::apply_generation_collapsed_update`].
+    ///
+    /// The range must lie inside the populated part of the tree
+    /// (`[0, generating_tree_first_free - 1]`) and must not be empty; every
+    /// other range is an error rather than a panic or a silently-empty update.
+    /// The source state must not have had this range collapsed away
+    /// ([`DustLocalState::collapse_generation_tree`]), which is reported as
+    /// [`DustLocalStateError::MerkleTreeError`].
+    pub fn collapsed_generation_update(
+        &self,
+        generation_index_start: u64,
+        generation_index_end: u64,
+    ) -> Result<MerkleTreeCollapsedUpdate, DustLocalStateError> {
+        Self::check_collapsed_update_range(
+            generation_index_start,
+            generation_index_end,
+            self.generating_tree_first_free,
+            "generation",
+        )?;
+        MerkleTreeCollapsedUpdate::new(
+            &self.generating_tree,
+            generation_index_start,
+            generation_index_end,
+        )
+        .map_err(DustLocalStateError::MerkleTreeError)
+    }
+
+    /// Rejects every collapsed-update range that
+    /// [`MerkleTreeCollapsedUpdate::new`] would answer with an unusable update
+    /// instead of an error.
+    ///
+    /// `new` itself only refuses `end < start` and `end` outside the tree's
+    /// `2^height` bounds. A range above `first_free` walks into the tree's stub
+    /// region, where it either fails with `StubUpdate` or — when the range
+    /// happens to align exactly with a whole stub subtree — succeeds with that
+    /// subtree's default hash, producing an update that would advance a
+    /// receiver's `first_free` past leaves the chain has not written yet. Both
+    /// are refused here, so the exported range check is the same one the
+    /// receiving side can reason about.
+    fn check_collapsed_update_range(
+        start: u64,
+        end: u64,
+        first_free: u64,
+        tree_name: &'static str,
+    ) -> Result<(), DustLocalStateError> {
+        if start > end || end >= first_free {
+            return Err(DustLocalStateError::CollapsedUpdateRangeInvalid {
+                start,
+                end,
+                first_free,
+                tree_name,
+            });
+        }
+        Ok(())
+    }
+
     pub fn insert_commitment(
         &self,
         commitment_index: u64,
@@ -1680,6 +1744,49 @@ impl<D: DB> DustLocalState<D> {
             commitment_tree_first_free: u64::max(self.commitment_tree_first_free, update.end + 1),
             ..self.clone()
         })
+    }
+
+    /// Cuts a collapsed update covering `[commitment_index_start, commitment_index_end]`
+    /// (inclusive) out of this state's commitment tree.
+    ///
+    /// This is the local-state counterpart of building the update from the
+    /// chain-side `DustUtxoState.commitments`; see
+    /// [`DustLocalState::collapsed_generation_update`] for the range rules, which
+    /// are the same with `commitment_tree_first_free` as the bound. The result is
+    /// applied by [`DustLocalState::apply_commitment_collapsed_update`].
+    pub fn collapsed_commitment_update(
+        &self,
+        commitment_index_start: u64,
+        commitment_index_end: u64,
+    ) -> Result<MerkleTreeCollapsedUpdate, DustLocalStateError> {
+        Self::check_collapsed_update_range(
+            commitment_index_start,
+            commitment_index_end,
+            self.commitment_tree_first_free,
+            "commitment",
+        )?;
+        MerkleTreeCollapsedUpdate::new(
+            &self.commitment_tree,
+            commitment_index_start,
+            commitment_index_end,
+        )
+        .map_err(DustLocalStateError::MerkleTreeError)
+    }
+
+    /// The next commitment-tree index this state will accept, i.e. the number of
+    /// DUST commitments it has seen.
+    ///
+    /// Callers need this to form valid ranges for
+    /// [`DustLocalState::collapsed_commitment_update`]; without it the populated
+    /// part of the tree is not observable from outside the crate.
+    pub fn commitment_tree_first_free(&self) -> u64 {
+        self.commitment_tree_first_free
+    }
+
+    /// The next generating-tree index this state will accept, i.e. the number of
+    /// DUST generation entries it has seen.
+    pub fn generating_tree_first_free(&self) -> u64 {
+        self.generating_tree_first_free
     }
 
     pub fn spend(
@@ -2248,6 +2355,234 @@ mod tests {
                 dsk_from_intermediate.repr(),
                 "Key computed from intermediate bytes does not match reference"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod collapsed_update_tests {
+    use super::{
+        DustGenerationInfo, DustLocalState, DustParameters, DustPublicKey, InitialNonce,
+        QualifiedDustOutput,
+    };
+    use crate::error::DustLocalStateError;
+    use base_crypto::hash::HashOutput;
+    use base_crypto::time::{Duration, Timestamp};
+    use storage::db::InMemoryDB;
+    use transient_crypto::curve::Fr;
+
+    const LEAVES: u64 = 9;
+    /// Indices the "wallet" keeps as its own, uncollapsed leaves; the collapsed
+    /// updates must cover exactly the gaps around them.
+    const OWN: [u64; 2] = [3, 6];
+
+    fn params() -> DustParameters {
+        DustParameters {
+            night_dust_ratio: 5_000_000_000,
+            generation_decay_rate: 500,
+            dust_grace_period: Duration::from_secs(600),
+        }
+    }
+
+    fn nonce_at(index: u64) -> InitialNonce {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        InitialNonce(HashOutput(bytes))
+    }
+
+    fn output_at(index: u64) -> QualifiedDustOutput {
+        QualifiedDustOutput {
+            initial_value: 1_000 + index as u128,
+            owner: DustPublicKey(Fr::from(index + 1)),
+            nonce: Fr::from(index + 7),
+            seq: 0,
+            ctime: Timestamp::from_secs(1_700_000_000 + index),
+            backing_night: nonce_at(index),
+            mt_index: index,
+        }
+    }
+
+    fn generation_at(index: u64) -> DustGenerationInfo {
+        DustGenerationInfo {
+            value: 2_000 + index as u128,
+            owner: DustPublicKey(Fr::from(index + 1)),
+            nonce: nonce_at(index),
+            dtime: Timestamp::from_secs(1_800_000_000 + index),
+        }
+    }
+
+    /// The node-side mirror: every leaf present, the ones this party does not
+    /// own collapsed individually (which is what `replay_events` with a
+    /// non-matching key produces).
+    fn mirror() -> DustLocalState<InMemoryDB> {
+        let mut state = DustLocalState::<InMemoryDB>::new(params());
+        for index in 0..LEAVES {
+            let own = OWN.contains(&index);
+            state = state
+                .insert_generation_info(
+                    index,
+                    generation_at(index),
+                    own.then(|| nonce_at(index)),
+                )
+                .expect("linear generation insertion must succeed");
+            state = state
+                .insert_commitment(index, output_at(index), own)
+                .expect("linear commitment insertion must succeed");
+        }
+        state
+    }
+
+    /// `[0, LEAVES - 1]` minus `OWN`, in ascending order.
+    fn gaps() -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        let mut start = 0u64;
+        for own in OWN {
+            if own > start {
+                ranges.push((start, own - 1));
+            }
+            start = own + 1;
+        }
+        if start <= LEAVES - 1 {
+            ranges.push((start, LEAVES - 1));
+        }
+        ranges
+    }
+
+    #[test]
+    fn collapsed_commitment_update_rebuilds_the_mirror_root() {
+        let source = mirror();
+        assert_eq!(source.commitment_tree_first_free(), LEAVES);
+
+        let mut rebuilt = DustLocalState::<InMemoryDB>::new(params());
+        let mut next_own = OWN.iter().copied();
+        for (start, end) in gaps() {
+            let update = source
+                .collapsed_commitment_update(start, end)
+                .expect("a gap inside the populated tree must be cuttable");
+            assert_eq!((update.start, update.end), (start, end));
+            rebuilt = rebuilt
+                .apply_commitment_collapsed_update(&update)
+                .expect("the update must apply to the rebuilt tree");
+            if let Some(own) = next_own.next() {
+                rebuilt = rebuilt
+                    .insert_commitment(own, output_at(own), true)
+                    .expect("the own leaf follows the gap linearly");
+            }
+        }
+
+        assert_eq!(rebuilt.commitment_tree_first_free(), LEAVES);
+        assert_eq!(
+            rebuilt.commitment_tree.root(),
+            source.commitment_tree.root()
+        );
+        assert!(rebuilt.commitment_tree.root().is_some());
+    }
+
+    #[test]
+    fn collapsed_generation_update_rebuilds_the_mirror_root() {
+        let source = mirror();
+        assert_eq!(source.generating_tree_first_free(), LEAVES);
+
+        let mut rebuilt = DustLocalState::<InMemoryDB>::new(params());
+        let mut next_own = OWN.iter().copied();
+        for (start, end) in gaps() {
+            let update = source
+                .collapsed_generation_update(start, end)
+                .expect("a gap inside the populated tree must be cuttable");
+            rebuilt = rebuilt
+                .apply_generation_collapsed_update(&update)
+                .expect("the update must apply to the rebuilt tree");
+            if let Some(own) = next_own.next() {
+                rebuilt = rebuilt
+                    .insert_generation_info(own, generation_at(own), Some(nonce_at(own)))
+                    .expect("the own leaf follows the gap linearly");
+            }
+        }
+
+        assert_eq!(rebuilt.generating_tree_first_free(), LEAVES);
+        assert_eq!(rebuilt.generating_tree.root(), source.generating_tree.root());
+        assert!(rebuilt.generating_tree.root().is_some());
+    }
+
+    #[test]
+    fn a_whole_tree_cut_rebuilds_a_state_that_owns_nothing() {
+        let source = mirror();
+        let rebuilt = DustLocalState::<InMemoryDB>::new(params())
+            .apply_commitment_collapsed_update(
+                &source
+                    .collapsed_commitment_update(0, LEAVES - 1)
+                    .expect("the whole populated range must be cuttable"),
+            )
+            .expect("the whole-range update must apply");
+        assert_eq!(
+            rebuilt.commitment_tree.root(),
+            source.commitment_tree.root()
+        );
+        assert_eq!(rebuilt.commitment_tree_first_free(), LEAVES);
+    }
+
+    fn assert_range_refused(
+        result: Result<transient_crypto::merkle_tree::MerkleTreeCollapsedUpdate, DustLocalStateError>,
+        expected_tree: &str,
+    ) {
+        match result {
+            Err(DustLocalStateError::CollapsedUpdateRangeInvalid { tree_name, .. }) => {
+                assert_eq!(tree_name, expected_tree)
+            }
+            other => panic!("expected a refused range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn out_of_range_cuts_are_errors_and_never_panics() {
+        let source = mirror();
+
+        // start after end
+        assert_range_refused(source.collapsed_commitment_update(5, 4), "commitment");
+        assert_range_refused(source.collapsed_generation_update(5, 4), "generation");
+        // end exactly at first_free, and far beyond it
+        assert_range_refused(source.collapsed_commitment_update(0, LEAVES), "commitment");
+        assert_range_refused(source.collapsed_generation_update(0, LEAVES), "generation");
+        assert_range_refused(
+            source.collapsed_commitment_update(LEAVES + 100, LEAVES + 200),
+            "commitment",
+        );
+        // beyond the tree's own 2^32 bound, and the u64 extremes: the range check
+        // refuses these before `MerkleTreeCollapsedUpdate::new` can reach the
+        // `end + 1` it computes internally.
+        assert_range_refused(
+            source.collapsed_commitment_update(0, u64::MAX),
+            "commitment",
+        );
+        assert_range_refused(
+            source.collapsed_commitment_update(u64::MAX, u64::MAX),
+            "commitment",
+        );
+        assert_range_refused(
+            source.collapsed_generation_update(u64::MAX, u64::MAX),
+            "generation",
+        );
+
+        // an empty state has nothing to cut at all, not even [0, 0]
+        let empty = DustLocalState::<InMemoryDB>::new(params());
+        assert_eq!(empty.commitment_tree_first_free(), 0);
+        assert_range_refused(empty.collapsed_commitment_update(0, 0), "commitment");
+        assert_range_refused(empty.collapsed_generation_update(0, 0), "generation");
+    }
+
+    #[test]
+    fn cutting_across_a_collapsed_range_is_an_error_not_a_panic() {
+        // `collapse_commitment_tree(0, 7)` replaces the whole aligned height-3
+        // subtree with a single hash. A cut whose steps sit below height 3 has to
+        // descend into it, and must report the merkle-tree error rather than
+        // producing an update with a wrong hash.
+        let collapsed = mirror()
+            .collapse_commitment_tree(0, 7)
+            .expect("collapsing an aligned subtree must succeed");
+        assert_eq!(collapsed.commitment_tree_first_free(), LEAVES);
+        match collapsed.collapsed_commitment_update(2, 5) {
+            Err(DustLocalStateError::MerkleTreeError(_)) => {}
+            other => panic!("expected a merkle-tree error, got {other:?}"),
         }
     }
 }

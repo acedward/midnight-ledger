@@ -1395,6 +1395,15 @@ pub enum DustLocalStateError {
     BackingNightNotFound {
         backing_night: InitialNonce,
     },
+    /// A collapsed update was requested for a range that is not entirely inside
+    /// the populated part of the tree (`[0, first_free - 1]`), or whose end is
+    /// before its start.
+    CollapsedUpdateRangeInvalid {
+        start: u64,
+        end: u64,
+        first_free: u64,
+        tree_name: &'static str,
+    },
     MerkleTreeError(InvalidUpdate),
 }
 
@@ -1426,6 +1435,16 @@ impl Display for DustLocalStateError {
                 f,
                 "failed to find generation info for backing night {:?}",
                 backing_night.0
+            ),
+            CollapsedUpdateRangeInvalid {
+                start,
+                end,
+                first_free,
+                tree_name,
+            } => write!(
+                f,
+                "collapsed update range [{start}, {end}] is not inside the populated part of the {tree_name} tree ([0, {}])",
+                first_free.saturating_sub(1)
             ),
             MerkleTreeError(err) => err.fmt(f),
         }
