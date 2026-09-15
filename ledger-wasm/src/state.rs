@@ -27,7 +27,7 @@ use onchain_runtime_wasm::from_value_ser;
 use onchain_runtime_wasm::state::ChargedState;
 use rand::Rng;
 use rand::rngs::OsRng;
-use serialize::tagged_serialize;
+use serialize::{Serializable, tagged_serialize};
 use storage::arena::Sp;
 use storage::db::InMemoryDB;
 use storage::storage::HashMap;
@@ -66,6 +66,15 @@ fn close_block_exact(
     let normalized =
         clamp_and_normalize_block_cost(accumulated_cost, state.parameters.limits.block_limits);
     state.post_block_update(tblock, normalized, overall_block_fullness(&normalized))
+}
+
+fn ledger_state_root(
+    state: &ledger::structure::LedgerState<InMemoryDB>,
+) -> Result<Vec<u8>, std::io::Error> {
+    let state = Sp::new(state.clone());
+    let mut root = Vec::new();
+    state.as_typed_key().serialize(&mut root)?;
+    Ok(root)
 }
 
 #[wasm_bindgen]
@@ -137,6 +146,13 @@ impl LedgerState {
             Timestamp::from_secs(js_date_to_seconds(tblock)),
             accumulated_cost,
         )?))
+    }
+
+    /// Returns the same untagged typed arena key that the node exposes through
+    /// `midnight_ledgerStateRoot` for the post-block ledger state.
+    #[wasm_bindgen(js_name = "ledgerStateRoot")]
+    pub fn ledger_state_root(&self) -> Result<Uint8Array, JsError> {
+        Ok(Uint8Array::from(ledger_state_root(&self.0)?.as_slice()))
     }
 
     #[wasm_bindgen(js_name = treasuryBalance)]
@@ -303,7 +319,7 @@ impl LedgerState {
 
 #[cfg(test)]
 mod exact_close_tests {
-    use super::{close_block_exact, overall_block_fullness};
+    use super::{close_block_exact, ledger_state_root, overall_block_fullness};
     use base_crypto::cost_model::{CostDuration, FixedPoint, NormalizedCost, SyntheticCost};
     use base_crypto::hash::persistent_hash;
     use base_crypto::time::Timestamp;
@@ -678,6 +694,25 @@ mod exact_close_tests {
             "synthetic-dominant-bytes-churned",
             CostDimension::BytesChurned,
         );
+    }
+
+    #[test]
+    fn ledger_state_root_is_the_serialized_typed_arena_key() {
+        use serialize::Serializable;
+        use storage::arena::Sp;
+
+        let state = LedgerState::<InMemoryDB>::new("local-test");
+        let state_pointer = Sp::new(state.clone());
+        let mut expected = Vec::new();
+        state_pointer
+            .as_typed_key()
+            .serialize(&mut expected)
+            .expect("the native typed arena key must serialize");
+
+        assert_eq!(ledger_state_root(&state).unwrap(), expected);
+
+        // The node allocates the same plain LedgerState and serializes this untagged typed key. A
+        // header root or tagged/full-state serialization cannot satisfy this structural oracle.
     }
 }
 
