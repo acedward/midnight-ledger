@@ -1968,10 +1968,59 @@ impl<D: DB> DustLocalState<D> {
             .map(|w| w.result)
     }
 
+    /// Replays events **keeping every leaf of both trees**, including the ones
+    /// `sk` does not own. Otherwise identical to [`DustLocalState::replay_events`].
+    ///
+    /// The ordinary replay collapses each foreign leaf, and `MerkleTree::collapse`
+    /// merges a pair of collapsed siblings into a single collapsed parent, so a
+    /// run of foreign leaves becomes one large aligned `Collapsed` subtree whose
+    /// interior is gone. That is the right trade for a wallet — it only needs its
+    /// own paths — but it makes the state unable to answer
+    /// [`DustLocalState::collapsed_commitment_update`] for any range that does not
+    /// happen to align with those subtrees.
+    ///
+    /// A party mirroring the chain's trees to *serve* collapsed updates therefore
+    /// needs this variant. It costs the interior nodes the ordinary replay throws
+    /// away, and it is pointless for a wallet, which should keep using
+    /// `replay_events`.
+    pub fn replay_events_retaining_all<'a>(
+        &self,
+        sk: &DustSecretKey,
+        events: impl IntoIterator<Item = &'a Event<D>>,
+    ) -> Result<Self, EventReplayError> {
+        self.replay_events_with_changes_retaining_all(sk, events)
+            .map(|w| w.result)
+    }
+
     pub fn replay_events_with_changes<'a>(
         &self,
         sk: &DustSecretKey,
         events: impl IntoIterator<Item = &'a Event<D>>,
+    ) -> Result<WithDustStateChanges<Self>, EventReplayError> {
+        self.replay_events_inner(sk, events, false)
+    }
+
+    /// [`DustLocalState::replay_events_retaining_all`] with the state changes, as
+    /// [`DustLocalState::replay_events_with_changes`] is to
+    /// [`DustLocalState::replay_events`].
+    pub fn replay_events_with_changes_retaining_all<'a>(
+        &self,
+        sk: &DustSecretKey,
+        events: impl IntoIterator<Item = &'a Event<D>>,
+    ) -> Result<WithDustStateChanges<Self>, EventReplayError> {
+        self.replay_events_inner(sk, events, true)
+    }
+
+    /// `retain_all` skips the three places this replay collapses a leaf it does
+    /// not own: the commitment leaf of a foreign `DustInitialUtxo`, the commitment
+    /// leaf of a foreign `DustSpendProcessed`, and the deferred generation
+    /// collapses. Nothing else differs -- collapsing only discards interior nodes,
+    /// so both variants reach the same two roots and the same wallet state.
+    fn replay_events_inner<'a>(
+        &self,
+        sk: &DustSecretKey,
+        events: impl IntoIterator<Item = &'a Event<D>>,
+        retain_all: bool,
     ) -> Result<WithDustStateChanges<Self>, EventReplayError> {
         let pk = DustPublicKey::from(sk.clone());
         let (mut res, gen_collapses) = events.into_iter().try_fold(
@@ -2032,15 +2081,17 @@ impl<D: DB> DustLocalState<D> {
                                 source: event.source.transaction_hash,
                             })
                         } else {
-                            // Carry out generation collapses *after* applying all the events,
-                            // because otherwise we might not have information around to process
-                            // partial dtime updates due to these only being rehashed on block
-                            // boundaries.
-                            gen_collapses.push(*generation_index);
-                            acc.result.commitment_tree = acc
-                                .result
-                                .commitment_tree
-                                .collapse(output.mt_index, output.mt_index);
+                            if !retain_all {
+                                // Carry out generation collapses *after* applying all the events,
+                                // because otherwise we might not have information around to process
+                                // partial dtime updates due to these only being rehashed on block
+                                // boundaries.
+                                gen_collapses.push(*generation_index);
+                                acc.result.commitment_tree = acc
+                                    .result
+                                    .commitment_tree
+                                    .collapse(output.mt_index, output.mt_index);
+                            }
                             None
                         };
                         if *block_time < acc.result.sync_time {
@@ -2122,10 +2173,12 @@ impl<D: DB> DustLocalState<D> {
                                 None
                             }
                         } else {
-                            acc.result.commitment_tree = acc
-                                .result
-                                .commitment_tree
-                                .collapse(*commitment_index, *commitment_index);
+                            if !retain_all {
+                                acc.result.commitment_tree = acc
+                                    .result
+                                    .commitment_tree
+                                    .collapse(*commitment_index, *commitment_index);
+                            }
                             None
                         };
                         if *block_time < acc.result.sync_time {
@@ -2362,12 +2415,15 @@ mod tests {
 #[cfg(test)]
 mod collapsed_update_tests {
     use super::{
-        DustGenerationInfo, DustLocalState, DustParameters, DustPublicKey, InitialNonce,
-        QualifiedDustOutput,
+        DustCommitment, DustGenerationInfo, DustLocalState, DustNullifier, DustParameters,
+        DustPublicKey, DustSecretKey, InitialNonce, QualifiedDustOutput,
     };
     use crate::error::DustLocalStateError;
+    use crate::events::{Event, EventDetails, EventSource};
+    use crate::structure::TransactionHash;
     use base_crypto::hash::HashOutput;
     use base_crypto::time::{Duration, Timestamp};
+    use serialize::{tagged_deserialize, tagged_serialize};
     use storage::db::InMemoryDB;
     use transient_crypto::curve::Fr;
 
@@ -2568,6 +2624,192 @@ mod collapsed_update_tests {
         assert_eq!(empty.commitment_tree_first_free(), 0);
         assert_range_refused(empty.collapsed_commitment_update(0, 0), "commitment");
         assert_range_refused(empty.collapsed_generation_update(0, 0), "generation");
+    }
+
+    /// Events shaped like preprod's: one `DustInitialUtxo` for every two
+    /// `DustSpendProcessed`s, none of them owned by the replaying key, each block
+    /// time strictly after the last.
+    fn foreign_events(count: u64) -> Vec<Event<InMemoryDB>> {
+        let mut events = Vec::new();
+        let mut commitment_index = 0u64;
+        let mut generation_index = 0u64;
+        for step in 0..count {
+            let source = EventSource {
+                transaction_hash: TransactionHash(HashOutput([step as u8; 32])),
+                logical_segment: 0,
+                physical_segment: 0,
+            };
+            let block_time = Timestamp::from_secs(1_700_000_000 + step);
+            let content = if step % 3 == 0 {
+                let mut output = output_at(commitment_index);
+                output.mt_index = commitment_index;
+                let details = EventDetails::DustInitialUtxo {
+                    output,
+                    generation: generation_at(generation_index),
+                    generation_index,
+                    block_time,
+                };
+                commitment_index += 1;
+                generation_index += 1;
+                details
+            } else {
+                let details = EventDetails::DustSpendProcessed {
+                    commitment: DustCommitment(Fr::from(step + 1_000)),
+                    commitment_index,
+                    nullifier: DustNullifier(Fr::from(step + 2_000)),
+                    v_fee: 7,
+                    declared_time: block_time,
+                    block_time,
+                };
+                commitment_index += 1;
+                details
+            };
+            events.push(Event { source, content });
+        }
+        events
+    }
+
+    /// A key that owns none of the leaves above, which is what a node-side mirror
+    /// holds. Asserted rather than assumed.
+    fn foreign_key(events: &[Event<InMemoryDB>]) -> DustSecretKey {
+        let sk = DustSecretKey(Fr::from(987_654_321u64));
+        let pk = DustPublicKey::from(sk.clone());
+        for event in events {
+            if let EventDetails::DustInitialUtxo { output, .. } = &event.content {
+                assert_ne!(pk, output.owner, "the test key must own nothing");
+            }
+        }
+        sk
+    }
+
+    #[test]
+    fn a_retained_replay_reaches_the_same_state_as_the_stock_replay() {
+        let events = foreign_events(40);
+        let sk = foreign_key(&events);
+        let blank = DustLocalState::<InMemoryDB>::new(params());
+
+        let stock = blank.replay_events(&sk, events.iter()).unwrap();
+        let retained = blank
+            .replay_events_retaining_all(&sk, events.iter())
+            .unwrap();
+
+        // Collapsing only throws interior nodes away, so everything observable
+        // through the public surface must be identical.
+        assert_eq!(retained.commitment_tree.root(), stock.commitment_tree.root());
+        assert_eq!(retained.generating_tree.root(), stock.generating_tree.root());
+        assert_eq!(
+            retained.commitment_tree_first_free(),
+            stock.commitment_tree_first_free()
+        );
+        assert_eq!(
+            retained.generating_tree_first_free(),
+            stock.generating_tree_first_free()
+        );
+        assert_eq!(retained.sync_time, stock.sync_time);
+        assert_eq!(retained.utxos().count(), stock.utxos().count());
+        assert!(retained.commitment_tree.root().is_some());
+    }
+
+    #[test]
+    fn only_a_retained_replay_can_cut_an_arbitrary_range() {
+        let events = foreign_events(40);
+        let sk = foreign_key(&events);
+        let blank = DustLocalState::<InMemoryDB>::new(params());
+        let stock = blank.replay_events(&sk, events.iter()).unwrap();
+        let retained = blank
+            .replay_events_retaining_all(&sk, events.iter())
+            .unwrap();
+        let first_free = retained.commitment_tree_first_free();
+        assert!(first_free >= 8, "the sample must be big enough to merge collapses");
+
+        // (b) after a retained replay, every single leaf and every prefix cuts.
+        for index in 0..first_free {
+            retained
+                .collapsed_commitment_update(index, index)
+                .unwrap_or_else(|err| panic!("retained [{index},{index}] must cut: {err}"));
+            retained
+                .collapsed_commitment_update(0, index)
+                .unwrap_or_else(|err| panic!("retained [0,{index}] must cut: {err}"));
+        }
+        for index in 0..retained.generating_tree_first_free() {
+            retained.collapsed_generation_update(index, index).unwrap();
+            retained.collapsed_generation_update(0, index).unwrap();
+        }
+
+        // The contrast that makes this export necessary: the stock replay's tree
+        // refuses nearly all of them, because collapsed siblings merged upward.
+        let stock_cuttable = (0..first_free)
+            .filter(|index| stock.collapsed_commitment_update(0, *index).is_ok())
+            .count();
+        assert!(
+            stock_cuttable * 4 < first_free as usize,
+            "expected the stock replay to refuse most prefixes, {stock_cuttable} of {first_free} cut"
+        );
+
+        // And the cut ranges rebuild the source root around an own leaf. It has to be
+        // one of the `DustInitialUtxo` indices -- every third, by construction of
+        // `foreign_events` -- because a spend's commitment is a bare field element
+        // with no payload to rebuild a `QualifiedDustOutput` from, which is exactly
+        // the constraint a real wallet works under.
+        let own = (first_free / 2 / 3) * 3;
+        assert!(own > 0 && own + 1 < first_free && own % 3 == 0);
+        let mut rebuilt = DustLocalState::<InMemoryDB>::new(params());
+        rebuilt = rebuilt
+            .apply_commitment_collapsed_update(
+                &retained.collapsed_commitment_update(0, own - 1).unwrap(),
+            )
+            .unwrap();
+        rebuilt = rebuilt
+            .insert_commitment(own, output_at(own), true)
+            .unwrap();
+        rebuilt = rebuilt
+            .apply_commitment_collapsed_update(
+                &retained
+                    .collapsed_commitment_update(own + 1, first_free - 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            rebuilt.commitment_tree_first_free(),
+            retained.commitment_tree_first_free()
+        );
+        // The own leaf is reinserted from its own payload, so its hash must be the
+        // one the replay wrote; the surrounding leaves come from the cuts.
+        assert_eq!(
+            rebuilt.commitment_tree.root(),
+            retained.commitment_tree.root()
+        );
+    }
+
+    #[test]
+    fn a_serialized_retained_state_is_still_cuttable() {
+        let events = foreign_events(40);
+        let sk = foreign_key(&events);
+        let retained = DustLocalState::<InMemoryDB>::new(params())
+            .replay_events_retaining_all(&sk, events.iter())
+            .unwrap();
+
+        let mut bytes = Vec::new();
+        tagged_serialize(&retained, &mut bytes).expect("a retained state must serialize");
+        let restored: DustLocalState<InMemoryDB> =
+            tagged_deserialize(&mut &bytes[..]).expect("a retained state must deserialize");
+
+        assert_eq!(
+            restored.commitment_tree.root(),
+            retained.commitment_tree.root()
+        );
+        assert_eq!(
+            restored.commitment_tree_first_free(),
+            retained.commitment_tree_first_free()
+        );
+        for index in 0..restored.commitment_tree_first_free() {
+            restored
+                .collapsed_commitment_update(index, index)
+                .unwrap_or_else(|err| panic!("restored [{index},{index}] must cut: {err}"));
+        }
+        for index in 0..restored.generating_tree_first_free() {
+            restored.collapsed_generation_update(0, index).unwrap();
+        }
     }
 
     #[test]
