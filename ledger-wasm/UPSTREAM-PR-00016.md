@@ -23,6 +23,19 @@ than one full ledger replay per wallet. Today that state can *apply* updates but
 them, so the service has to keep a chain-side `DustUtxoState`/`DustGenerationState` it has no
 other use for, or reconstruct a `LedgerState` from blocks.
 
+## The second half of the gap: the producing state collapses itself
+
+`DustLocalState::replay_events` collapses every leaf the replaying key does not own, and
+`MerkleTree::collapse` merges a pair of collapsed siblings into one collapsed parent. A run of
+foreign leaves therefore becomes a single large aligned `Collapsed` subtree whose interior is gone.
+
+For a wallet that is exactly right. For the mirror above it is fatal, and not marginally: over the
+first 5 000 preprod DUST events (3 989 commitment leaves) such a state can cut **7 of 3 988**
+prefixes -- the canonical decomposition boundaries -- and **1 of 3 989** single leaves. Over 200
+uniformly random own-leaf positions, **not one** had both of its surrounding ranges cuttable. So the
+two methods above are unusable from a replayed state unless the replay can be told to keep its
+leaves.
+
 ## The change
 
 Two methods on `DustLocalState`, the exact inverses of the `apply_*_collapsed_update` pair
@@ -36,13 +49,27 @@ pub fn collapsed_generation_update(&self, start: u64, end: u64)
     -> Result<MerkleTreeCollapsedUpdate, DustLocalStateError>;
 pub fn commitment_tree_first_free(&self) -> u64;
 pub fn generating_tree_first_free(&self) -> u64;
+
+// the replay that keeps its leaves, so the two methods above have something to cut
+pub fn replay_events_retaining_all<'a>(&self, sk: &DustSecretKey, events: …)
+    -> Result<Self, EventReplayError>;
+pub fn replay_events_with_changes_retaining_all<'a>(&self, sk: &DustSecretKey, events: …)
+    -> Result<WithDustStateChanges<Self>, EventReplayError>;
 ```
+
+`replay_events_with_changes` gains one `retain_all: bool` on a shared inner implementation; the
+existing signatures are untouched. `retain_all` skips the three places the fold collapses: the
+commitment leaf of a foreign `DustInitialUtxo`, the commitment leaf of a foreign
+`DustSpendProcessed`, and the deferred generation collapses. Nothing else differs, and collapsing
+only discards interior nodes, so both variants reach the same two roots, the same `first_free`s and
+the same wallet state.
 
 ```ts
 collapsedCommitmentUpdate(commitmentIndexStart: bigint, commitmentIndexEnd: bigint): DustStateMerkleTreeCollapsedUpdate;
 collapsedGenerationUpdate(generationIndexStart: bigint, generationIndexEnd: bigint): DustStateMerkleTreeCollapsedUpdate;
 readonly commitmentTreeFirstFree: bigint;
 readonly generatingTreeFirstFree: bigint;
+replayRawEventsRetainingAll(sk: DustSecretKey, rawEvents: Uint8Array): DustLocalStateWithChanges;
 ```
 
 Nothing existing changes behaviour; `DustLocalStateError` is `#[non_exhaustive]` and gains one
@@ -85,3 +112,25 @@ leaves from the event payloads, and both roots must equal the mirror's. Each seg
 serialized and deserialized on the way, so the proof covers the wire form. The error cases are
 asserted through the JavaScript boundary, where a missing range check would answer instead of
 throwing.
+
+The same script then replays those events with `replayRawEventsRetainingAll` and requires the
+result to agree with the stock replay on both roots and both `first_free`s, and to answer the draw
+the stock mirror fails: 200 uniformly random own-leaf positions, 200 of 200 servable against 0 of
+200, with five carried through the full round trip back to the chain's root.
+
+## What retaining costs
+
+Measured over four prefixes of the same sample, in child processes so the two variants never share
+an allocator:
+
+| | stock replay | retain-all replay |
+|---|---|---|
+| serialized state (exact, R² = 0.9998) | flat ≈ 3.5 KiB | **97.7 B per leaf** |
+| WebAssembly heap (`external` delta, R² = 0.987) | 855 B per leaf | **2 032 B per leaf** |
+| replay speed | 1.63–1.86 ms/event | **1.03–1.29 ms/event** |
+
+Retaining is *faster*, because it skips the collapse and the rehash it forces. It is larger in
+proportion to the leaves, which is the point: those are the interior nodes a collapsed update is
+cut from. The heap figure is a peak rather than a resident size — linear memory never shrinks, so a
+batched replay's intermediate tree versions are counted, which is why even the collapsed mirror
+measures 855 B per leaf.
