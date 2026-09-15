@@ -529,6 +529,24 @@ export class DustLocalState {
    * Replays a direct concatenation of serialized ledger events. Otherwise acts as `replayEventsWithChanges`.
    */
   replayRawEvents(sk: DustSecretKey, rawEvents: Uint8Array): DustLocalStateWithChanges;
+  /**
+   * {@link DustLocalState.replayRawEvents}, but keeping every leaf of both trees --
+   * including the ones `sk` does not own -- so the resulting state can still cut
+   * collapsed updates for arbitrary ranges with
+   * {@link DustLocalState.collapsedCommitmentUpdate} and
+   * {@link DustLocalState.collapsedGenerationUpdate}.
+   *
+   * This is for a service that mirrors the chain's DUST trees in order to **serve**
+   * collapsed updates to wallets. **A wallet must not use it**: the ordinary
+   * {@link DustLocalState.replayRawEvents} collapses the leaves a wallet has no use
+   * for, which is both cheaper and smaller, and a wallet never needs to cut a
+   * segment. Retaining everything keeps the interior nodes the ordinary replay
+   * discards, so the state is larger in proportion to the number of leaves.
+   *
+   * Both variants reach the same two roots and the same wallet state; collapsing
+   * only discards interior nodes.
+   */
+  replayRawEventsRetainingAll(sk: DustSecretKey, rawEvents: Uint8Array): DustLocalStateWithChanges;
   addUtxo(nullifier: DustNullifier, utxo: QualifiedDustOutput, pendingUntil?: Date): DustLocalState;
   findUtxoByNullifier(nullifier: DustNullifier): QualifiedDustOutput | undefined;
   removeUtxo(nullifier: DustNullifier): DustLocalState;

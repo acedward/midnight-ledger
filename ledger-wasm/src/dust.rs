@@ -1538,6 +1538,34 @@ impl DustLocalState {
         Ok(DustLocalStateWithChanges::from(with_changes))
     }
 
+    /// `replayRawEvents`, but keeping every leaf of both trees -- including the
+    /// ones `sk` does not own -- so the resulting state can still cut collapsed
+    /// updates for arbitrary ranges with `collapsedCommitmentUpdate` and
+    /// `collapsedGenerationUpdate`.
+    ///
+    /// This is for a service that mirrors the chain's DUST trees in order to
+    /// **serve** collapsed updates to wallets. **A wallet must not use it**: the
+    /// ordinary `replayRawEvents` collapses the leaves a wallet has no use for,
+    /// which is both cheaper and smaller, and a wallet never needs to cut a
+    /// segment. Retaining everything keeps the interior nodes the ordinary replay
+    /// discards, so the state is larger in proportion to the number of leaves.
+    ///
+    /// Both variants reach the same two roots and the same wallet state;
+    /// collapsing only discards interior nodes.
+    #[wasm_bindgen(js_name = "replayRawEventsRetainingAll")]
+    pub fn replay_raw_events_retaining_all(
+        &self,
+        sk: &DustSecretKey,
+        raw_events: &[u8],
+    ) -> Result<DustLocalStateWithChanges, JsError> {
+        let sk = sk.try_unwrap()?;
+        let events = tagged_deserialize_sequence(raw_events)?;
+        let with_changes = self
+            .0
+            .replay_events_with_changes_retaining_all(&sk, events.iter())?;
+        Ok(DustLocalStateWithChanges::from(with_changes))
+    }
+
     #[wasm_bindgen(js_name = "addUtxo")]
     pub fn add_utxo(
         &self,
