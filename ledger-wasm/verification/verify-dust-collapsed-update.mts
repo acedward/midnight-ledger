@@ -35,6 +35,7 @@
 //       /media/eddie/mn-nvme/00016/ledger-v8-syshash.5/midnight_ledger_wasm_fs.js \
 //       [--sample /media/eddie/mn-nvme/00016/samples/dust-events-preprod-5000.bin] \
 //       [--events 5000] [--indexer wss://indexer.preprod.midnight.network/api/v4/graphql/ws]
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -136,6 +137,58 @@ if (rawEvents.length === 0) throw new Error("no DUST events to verify against");
 
 const params = ledger.LedgerParameters.initialParameters();
 const blank = (): any => new ledger.DustLocalState(params.dust);
+
+/** Replays a prefix of the sample in batches of 1 000 with one of the two replay methods. */
+const replayMirror = (
+  method: "replayRawEvents" | "replayRawEventsRetainingAll",
+  count: number,
+): { state: any; ms: number } => {
+  const key = ledger.sampleDustSecretKey();
+  const started = ms();
+  let state = blank();
+  for (let at = 0; at < count; at += 1000) {
+    const batch = rawEvents.slice(at, Math.min(at + 1000, count)).map((event) => Buffer.from(event));
+    state = state[method](key, Buffer.concat(batch)).state;
+  }
+  return { state, ms: ms() - started };
+};
+
+// A memory child: one process, one mirror, so the two variants' footprints cannot be confused by
+// a shared allocator. WebAssembly linear memory is not reachable from the generated JS surface --
+// `wasm.memory` stays module-private in `midnight_ledger_wasm_bg.js` -- so resident set size is the
+// measurement, taken after the sample is already loaded and parsed so the JS-side event buffers sit
+// in the baseline rather than in the delta.
+const MEMORY_MODE = flag("memory-mode", "");
+if (MEMORY_MODE) {
+  const count = Number(flag("memory-events", String(rawEvents.length)));
+  const method = MEMORY_MODE === "retained" ? "replayRawEventsRetainingAll" : "replayRawEvents";
+  // Touch the module once so its own start-up allocations land in the baseline.
+  blank().commitmentTreeRoot();
+  (globalThis as any).gc?.();
+  const before = process.memoryUsage();
+  const { state, ms: replayedMs } = replayMirror(method as any, count);
+  (globalThis as any).gc?.();
+  const after = process.memoryUsage();
+  process.stdout.write(
+    `${JSON.stringify({
+      mode: MEMORY_MODE,
+      events: count,
+      commitmentLeaves: Number(state.commitmentTreeFirstFree),
+      generationLeaves: Number(state.generatingTreeFirstFree),
+      // `external` is where Node counts the WebAssembly linear memory, and it moves in whole
+      // allocator chunks rather than in whole pages, so it is far less noisy than `rss`.
+      externalDelta: after.external - before.external,
+      rssDelta: after.rss - before.rss,
+      // The exact, deterministic size of the state itself -- and the number FR-012's snapshot
+      // writes to disk.
+      serializedBytes: state.serialize().length,
+      replayMs: round(replayedMs, 1),
+      commitmentRoot: String(state.commitmentTreeRoot()),
+      generationRoot: String(state.generatingTreeRoot()),
+    })}\n`,
+  );
+  process.exit(0);
+}
 
 for (const getter of ["commitmentTreeFirstFree", "generatingTreeFirstFree"]) {
   if (typeof blank()[getter] !== "bigint") throw new Error(`FAIL: ${getter} is not exported`);
@@ -299,13 +352,9 @@ const generationTiming = roundTrip("generation", generationSource, (state, index
 
 // ----------------- part 3: the key-less mirror, and what it can and cannot cut
 
-const replayStart = ms();
-let mirror = blank();
-for (let at = 0; at < rawEvents.length; at += 1000) {
-  const batch = rawEvents.slice(at, at + 1000).map((event) => Buffer.from(event));
-  mirror = mirror.replayRawEvents(ledger.sampleDustSecretKey(), Buffer.concat(batch)).state;
-}
-const replayMs = ms() - replayStart;
+const stockReplay = replayMirror("replayRawEvents", rawEvents.length);
+const mirror = stockReplay.state;
+const replayMs = stockReplay.ms;
 const mirrorCommitmentFirstFree = mirror.commitmentTreeFirstFree as bigint;
 const mirrorGenerationFirstFree = mirror.generatingTreeFirstFree as bigint;
 const mirrorCommitmentRoot = String(mirror.commitmentTreeRoot());
@@ -364,6 +413,291 @@ check(
     "so a key-less mirror cannot serve /v1/dust/segments (see 00016 Q-12)",
 );
 
+// ------------- part 5: the retain-all mirror, which is what a node must use
+
+if (typeof blank().replayRawEventsRetainingAll !== "function") {
+  throw new Error("FAIL: replayRawEventsRetainingAll is not exported on DustLocalState");
+}
+const retainedReplay = replayMirror("replayRawEventsRetainingAll", rawEvents.length);
+const retained = retainedReplay.state;
+console.log(
+  `\nretained mirror: ${rawEvents.length} events replayed in ${round(retainedReplay.ms, 1)} ms ` +
+    `(${round(retainedReplay.ms / rawEvents.length)} ms/event)`,
+);
+
+// (a) Collapsing only discards interior nodes, so the retained mirror must agree with the stock
+// one on everything observable. If it did not, the new replay would be changing the chain's state,
+// not just its representation.
+check(
+  "retained mirror: same commitment root as the stock replay",
+  String(retained.commitmentTreeRoot()) === mirrorCommitmentRoot,
+  `${String(retained.commitmentTreeRoot()).slice(0, 18)}…`,
+);
+check(
+  "retained mirror: same generation root as the stock replay",
+  String(retained.generatingTreeRoot()) === mirrorGenerationRoot,
+  `${String(retained.generatingTreeRoot()).slice(0, 18)}…`,
+);
+check(
+  "retained mirror: same firstFree as the stock replay",
+  retained.commitmentTreeFirstFree === mirrorCommitmentFirstFree &&
+    retained.generatingTreeFirstFree === mirrorGenerationFirstFree,
+  `commitment ${retained.commitmentTreeFirstFree}, generation ${retained.generatingTreeFirstFree}`,
+);
+
+// (b) The draw the stock mirror failed 200 times out of 200: an arbitrary own leaf, and the two
+// ranges around it that `/v1/dust/segments` would have to answer with.
+const DRAWS = 200;
+const firstFree = retained.commitmentTreeFirstFree as bigint;
+let servable = 0;
+const drawn: bigint[] = [];
+for (let draw = 0; draw < DRAWS; draw++) {
+  const own = BigInt(1 + Math.floor(Math.random() * (Number(firstFree) - 2)));
+  drawn.push(own);
+  try {
+    retained.collapsedCommitmentUpdate(0n, own - 1n);
+    retained.collapsedCommitmentUpdate(own + 1n, firstFree - 1n);
+    servable += 1;
+  } catch {
+    /* counted as a failure */
+  }
+}
+check(
+  `retained mirror: ${DRAWS} random own leaves are all servable`,
+  servable === DRAWS,
+  `${servable} of ${DRAWS} (the stock mirror scored 0 of ${DRAWS} on the same draw)`,
+);
+
+// ...and the segments really rebuild the root. Only a `dustInitialUtxo` index can be checked this
+// way, because a spend's commitment has no public payload to reinsert from -- the same constraint
+// a wallet works under, since it can only reinsert leaves it can reconstruct.
+const ownCandidates = initialUtxos
+  .map((utxo) => BigInt(utxo.output.mtIndex))
+  .filter((index) => index > 0n && index + 1n < firstFree);
+const ROUND_TRIPS = 5;
+let rebuilt = 0;
+const rebuildTimings: { cutMs: number[]; applyMs: number[] } = { cutMs: [], applyMs: [] };
+for (let pick = 0; pick < ROUND_TRIPS; pick++) {
+  const own = ownCandidates[Math.floor((ownCandidates.length * (pick + 0.5)) / ROUND_TRIPS)]!;
+  const payload = initialUtxos.find((utxo) => BigInt(utxo.output.mtIndex) === own)!.output;
+  let state = blank();
+  for (const [start, end] of [
+    [0n, own - 1n],
+    [own + 1n, firstFree - 1n],
+  ] as [bigint, bigint][]) {
+    if (start > end) continue;
+    const cutAt = ms();
+    const update = retained.collapsedCommitmentUpdate(start, end);
+    rebuildTimings.cutMs.push(ms() - cutAt);
+    const wire = ledger.DustStateMerkleTreeCollapsedUpdate.deserialize(update.serialize());
+    const applyAt = ms();
+    state = state.applyCommitmentCollapsedUpdate(wire);
+    rebuildTimings.applyMs.push(ms() - applyAt);
+    if (start === 0n) state = state.insertCommitment(own, payload, true);
+  }
+  if (
+    String(state.commitmentTreeRoot()) === mirrorCommitmentRoot &&
+    state.commitmentTreeFirstFree === firstFree
+  ) {
+    rebuilt += 1;
+  }
+}
+check(
+  `retained mirror: ${ROUND_TRIPS} own leaves rebuild the chain's root from their segments`,
+  rebuilt === ROUND_TRIPS,
+  `${rebuilt} of ${ROUND_TRIPS}; cut ${round(median(rebuildTimings.cutMs))} ms median, ` +
+    `apply ${round(median(rebuildTimings.applyMs))} ms median`,
+);
+
+// (c) Memory. Each child process builds exactly one mirror, so the two variants never share an
+// allocator, and each prefix is measured twice with the smaller delta kept -- the surplus in the
+// other run is allocator slack or uncollected JS garbage, not state.
+//
+// One caveat the numbers carry with them: WebAssembly linear memory never shrinks, so an RSS delta
+// is the *peak* the replay needed, intermediate versions of the persistent trees included, not the
+// resident size of the final state. It is the conservative direction for an SC-004 check.
+//
+// Commitment and generation leaves cannot be priced separately from this sample: every
+// `dustInitialUtxo` adds one of each, so the two counts are near-collinear across any prefix and
+// the 2x2 solve is ill-conditioned (it returns negative bytes per commitment leaf). The fit is
+// therefore over *total* leaves, which is well conditioned, and preprod is projected from its total.
+const PREPROD_COMMITMENT_LEAVES = 1_191_877;
+const PREPROD_GENERATION_LEAVES = 417_002;
+const PREPROD_LEAVES = PREPROD_COMMITMENT_LEAVES + PREPROD_GENERATION_LEAVES;
+const MEMORY_PREFIXES = [1, 2, 3, 4].map((part) =>
+  Math.floor((rawEvents.length * part) / 4),
+);
+const REPEATS = 2;
+
+type MemoryPoint = {
+  mode: string;
+  events: number;
+  commitmentLeaves: number;
+  generationLeaves: number;
+  externalDelta: number;
+  rssDelta: number;
+  serializedBytes: number;
+  replayMs: number;
+};
+
+const measure = (mode: "stock" | "retained", events: number): MemoryPoint | null => {
+  const runs: MemoryPoint[] = [];
+  for (let repeat = 0; repeat < REPEATS; repeat++) {
+    const child = spawnSync(
+      process.execPath,
+      [
+        ...process.execArgv,
+        "--expose-gc",
+        process.argv[1]!,
+        entry,
+        "--sample",
+        SAMPLE,
+        "--memory-mode",
+        mode,
+        "--memory-events",
+        String(events),
+      ],
+      { encoding: "utf8", maxBuffer: 1 << 24 },
+    );
+    const line = (child.stdout ?? "").trim().split("\n").pop() ?? "";
+    try {
+      runs.push(JSON.parse(line) as MemoryPoint);
+    } catch {
+      console.log(`  memory child (${mode}, ${events}) failed: ${(child.stderr ?? "").slice(-300)}`);
+    }
+  }
+  if (runs.length === 0) return null;
+  // The smallest heap delta is the cleanest estimate of what the mirror actually needed; the
+  // surplus in the other run is allocator slack or garbage that had not been collected. The
+  // serialized size is deterministic and identical across runs.
+  return runs.reduce((best, run) => (run.externalDelta < best.externalDelta ? run : best));
+};
+
+const memoryPoints: MemoryPoint[] = [];
+for (const mode of ["stock", "retained"] as const) {
+  for (const events of MEMORY_PREFIXES) {
+    const point = measure(mode, events);
+    if (point) memoryPoints.push(point);
+  }
+}
+
+const mib = (bytes: number): number => round(bytes / 1024 / 1024, 1);
+
+/** Least-squares `y = perLeaf * (C + G) + fixed` over every prefix of one mode. */
+const fit = (points: MemoryPoint[], y: (point: MemoryPoint) => number) => {
+  const leaves = points.map((point) => point.commitmentLeaves + point.generationLeaves);
+  const values = points.map(y);
+  const n = points.length;
+  const meanLeaves = leaves.reduce((a, b) => a + b, 0) / n;
+  const meanValue = values.reduce((a, b) => a + b, 0) / n;
+  const sxx = leaves.reduce((acc, x) => acc + (x - meanLeaves) ** 2, 0);
+  if (n < 2 || sxx === 0) return null;
+  const perLeaf =
+    leaves.reduce((acc, x, i) => acc + (x - meanLeaves) * (values[i]! - meanValue), 0) / sxx;
+  const fixed = meanValue - perLeaf * meanLeaves;
+  const residual = values.reduce((acc, v, i) => acc + (v - (perLeaf * leaves[i]! + fixed)) ** 2, 0);
+  const total = values.reduce((acc, v) => acc + (v - meanValue) ** 2, 0);
+  return {
+    perLeafBytes: round(perLeaf, 1),
+    fixedBytes: Math.round(fixed),
+    rSquared: round(total === 0 ? 1 : 1 - residual / total, 4),
+    preprodBytes: Math.round(perLeaf * PREPROD_LEAVES + fixed),
+    preprodMiB: mib(perLeaf * PREPROD_LEAVES + fixed),
+  };
+};
+
+const summarise = (mode: string) => {
+  const points = memoryPoints.filter((point) => point.mode === mode);
+  if (points.length < 2) return null;
+  return {
+    mode,
+    points: points.map((point) => ({
+      events: point.events,
+      leaves: point.commitmentLeaves + point.generationLeaves,
+      commitmentLeaves: point.commitmentLeaves,
+      generationLeaves: point.generationLeaves,
+      serializedKiB: round(point.serializedBytes / 1024, 1),
+      externalMiB: mib(point.externalDelta),
+      rssMiB: mib(point.rssDelta),
+      msPerEvent: round(point.replayMs / point.events),
+    })),
+    // Deterministic: the state's own bytes, and what FR-012's snapshot writes.
+    serialized: fit(points, (point) => point.serializedBytes),
+    // The WebAssembly heap. Linear memory never shrinks, so this is the peak the replay needed --
+    // intermediate versions of the persistent trees included -- not the resident final state.
+    wasmHeap: fit(points, (point) => point.externalDelta),
+    rss: fit(points, (point) => point.rssDelta),
+  };
+};
+
+const stockMemory = summarise("stock");
+const retainedMemory = summarise("retained");
+const fullOf = (mode: string) =>
+  memoryPoints.find((point) => point.mode === mode && point.events === rawEvents.length);
+const fullStock = fullOf("stock");
+const fullRetained = fullOf("retained");
+console.log(`\nmemory: ${JSON.stringify({ stock: stockMemory, retained: retainedMemory }, null, 1)}`);
+
+let retainOverheadPerLeaf: number | null = null;
+if (fullStock && fullRetained) {
+  const leaves = fullRetained.commitmentLeaves + fullRetained.generationLeaves;
+  retainOverheadPerLeaf = (fullRetained.externalDelta - fullStock.externalDelta) / leaves;
+  console.log(
+    `  at the full sample (${leaves} leaves): serialized ` +
+      `${round(fullStock.serializedBytes / 1024, 1)} KiB stock vs ` +
+      `${round(fullRetained.serializedBytes / 1024, 1)} KiB retained; wasm heap ` +
+      `${mib(fullStock.externalDelta)} MiB vs ${mib(fullRetained.externalDelta)} MiB, i.e. ` +
+      `${round(retainOverheadPerLeaf, 0)} B per leaf more to retain ` +
+      `(${mib(PREPROD_LEAVES * retainOverheadPerLeaf)} MiB over the stock mirror at preprod scale)`,
+  );
+}
+
+const SC004_BYTES = 1.5 * 1024 * 1024 * 1024;
+if (retainedMemory?.wasmHeap && retainedMemory.serialized) {
+  const heap = retainedMemory.wasmHeap;
+  const over = heap.preprodBytes > SC004_BYTES;
+  console.log(
+    `${over ? "WARN" : "INFO"} retained mirror: projected preprod WASM heap ${heap.preprodMiB} MiB ` +
+      `for ${PREPROD_LEAVES} leaves (${PREPROD_COMMITMENT_LEAVES} commitment + ` +
+      `${PREPROD_GENERATION_LEAVES} generation) at ${heap.perLeafBytes} B/leaf, R²=${heap.rSquared}` +
+      (stockMemory?.wasmHeap
+        ? `; the stock mirror projects ${stockMemory.wasmHeap.preprodMiB} MiB — which is itself ` +
+          "near SC-004, so this instrument is measuring replay churn as much as final state"
+        : "") +
+      ` — SC-004's limit is ${mib(SC004_BYTES)} MiB`,
+  );
+  console.log(
+    `  the state's own serialized size projects ` +
+      `${retainedMemory.serialized.preprodMiB} MiB at ${retainedMemory.serialized.perLeafBytes} B/leaf ` +
+      `(R²=${retainedMemory.serialized.rSquared}) — that is the FR-012 snapshot size, and the floor ` +
+      `the in-memory arena is a multiple of.\n` +
+      `  NOTE: preprod is a ${Math.round(PREPROD_LEAVES / 5370)}x extrapolation from at most 5 370 ` +
+      "leaves. The serialized fit is exact (a Merkle tree serializes linearly in its nodes); the " +
+      "heap fit is not, because WebAssembly memory never shrinks and the deltas are a few MiB. " +
+      "Treat the heap number as an order of magnitude and measure SC-004 for real in Phase 4, " +
+      "where the mirror is built against the full archive anyway.",
+  );
+  if (over) {
+    console.log(
+      "\n!!! SC-004 AT RISK (a projection, not a verdict — Phase 4 measures it for real): " +
+        "the retain-all mirror's projected preprod WASM heap " +
+        `(${heap.preprodMiB} MiB) exceeds 1.5 GB.\n` +
+        "    Mitigations to weigh in question Q-12 before Phase 4:\n" +
+        "      1. Keep the GENERATING tree collapsed and retain only the commitment tree: a wallet\n" +
+        "         asks for generation segments once, over its own few generation indices, and the\n" +
+        "         node could serve those from a second, short-lived retained replay. Saves the\n" +
+        `         ${PREPROD_GENERATION_LEAVES} generation leaves (~26% of the total).\n` +
+        "      2. Split the two trees across the two nodes behind the balancer; /v1/dust/segments\n" +
+        "         already carries ?tree=, so the balancer can route by it instead of at random.\n" +
+        "      3. Raise SC-004 for the measurement rig: it is one node on a shared host, not\n" +
+        "         production, and 2-3 GB is affordable there if the host has it.\n" +
+        "    Do NOT drop the retain-all replay: without it segments cannot be served at all (0/200).",
+    );
+  }
+} else {
+  check("retained mirror: memory measured", false, "the memory children produced no usable output");
+}
+
 // ------------------------------------------------------------- part 4: the errors
 
 const throws = (label: string, call: () => unknown): void => {
@@ -416,6 +750,25 @@ const timings = {
     wholeRangeCutMs: round(mirrorWholeRangeMs, 1),
     cuttablePrefixes,
   },
+  retainedMirror: {
+    replayMs: round(retainedReplay.ms, 1),
+    msPerEvent: round(retainedReplay.ms / rawEvents.length),
+    servableDraws: `${servable}/${DRAWS}`,
+    rootRebuilds: `${rebuilt}/${ROUND_TRIPS}`,
+    cutMsMedian: round(median(rebuildTimings.cutMs)),
+    applyMsMedian: round(median(rebuildTimings.applyMs)),
+  },
+  memory: {
+    note:
+      "measured in child processes, one mirror each. `serialized` is the state's own bytes and is " +
+      "exact; `wasmHeap` is Node's `external` delta, i.e. the peak WebAssembly heap the replay " +
+      "needed (linear memory never shrinks), and is noisy at these sizes. Commitment and " +
+      "generation leaves are collinear in this sample, so the fits are over total leaves and " +
+      "preprod is projected from its total. ~300x extrapolation: measure SC-004 for real in Phase 4",
+    retainOverheadBytesPerLeaf: retainOverheadPerLeaf === null ? null : round(retainOverheadPerLeaf, 0),
+    stock: stockMemory,
+    retained: retainedMemory,
+  },
 };
 console.log(`\ntimings: ${JSON.stringify(timings, null, 1)}`);
 
@@ -435,7 +788,7 @@ writeFileSync(
         generationRoot: mirrorGenerationRoot,
       },
       // The uncollapsed source trees parts 1 and 2 cut from.
-      retained: {
+      retainedSources: {
         leaves: Number(LEAVES),
         ownIndices: OWN.map(String),
         commitmentRoot: String(commitmentSource.commitmentTreeRoot()),
@@ -451,8 +804,9 @@ console.log(`roots and timings written to ${ROOTS_FILE}`);
 
 console.log(
   failures === 0
-    ? "\nOK: both trees rebuild to their source roots from cut segments, " +
-        "every out-of-range cut throws, and the key-less mirror's limitation is pinned"
+    ? "\nOK: both trees rebuild to their source roots from cut segments, every out-of-range cut " +
+        "throws, the stock mirror's limitation is pinned, and the retain-all mirror serves every " +
+        "random own leaf"
     : `\n${failures} check(s) FAILED`,
 );
 process.exit(failures === 0 ? 0 : 1);
