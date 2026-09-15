@@ -20,7 +20,7 @@
 // The mirror's trees therefore hold large aligned `Collapsed` subtrees, and a cut that would have
 // to descend into one is refused. Only the whole populated range and the handful of ranges ending
 // on a decomposition boundary survive. This is asserted here so the fact is pinned to a build, not
-// remembered: see questions Q-10 of project 00016.
+// remembered: see question Q-12 of project 00016.
 //
 // Part 4 asserts every out-of-range form throws. `MerkleTreeCollapsedUpdate::new` alone does not
 // reject a range past `first_free` -- it can walk into the tree's stub region and, when a step
@@ -338,11 +338,11 @@ check(
   `[0, ${mirrorCommitmentFirstFree - 1n}] in ${round(mirrorWholeRangeMs, 1)} ms`,
 );
 check(
-  "mirror: arbitrary gaps are NOT cuttable (pins Q-10, not a capability)",
+  "mirror: arbitrary gaps are NOT cuttable (pins Q-12, not a capability)",
   cuttablePrefixes < Number(mirrorCommitmentFirstFree) / 100,
   `${cuttablePrefixes} of ${mirrorCommitmentFirstFree - 1n} prefixes [0,e] can be cut — ` +
     "replay collapses foreign leaves and MerkleTreeNode::collapse merges collapsed siblings, " +
-    "so a key-less mirror cannot serve /v1/dust/segments (see 00016 Q-10)",
+    "so a key-less mirror cannot serve /v1/dust/segments (see 00016 Q-12)",
 );
 
 // ------------------------------------------------------------- part 4: the errors
