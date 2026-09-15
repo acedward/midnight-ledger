@@ -317,6 +317,25 @@ console.log(
     `generationFirstFree=${mirrorGenerationFirstFree}`,
 );
 
+// The strongest check available here, and it is free: the generating tree built in part 2 by
+// inserting the parsed `dustInitialUtxo` entries -- each carrying the `dtime` the latest
+// `dustGenerationDtimeUpdate` annotation gave it -- must have the same root as the mirror's
+// generating tree, which the ledger itself built by replaying those same events through
+// `update_from_evidence` on its own insertion paths. Equality proves the annotation really is the
+// post-update entry and that the leaves reconstruct bit for bit. (The commitment roots differ by
+// construction: the mirror's tree also holds one leaf per spend, which no public payload rebuilds.)
+check(
+  "generation: the rebuilt leaves match the ledger's own replay",
+  String(generationSource.generatingTreeRoot()) === mirrorGenerationRoot,
+  `${LEAVES} entries reinserted from parsed annotations vs the mirror's replay of ` +
+    `${rawEvents.length} events: ${mirrorGenerationRoot.slice(0, 18)}…`,
+);
+check(
+  "mirror: generating tree has one leaf per initial utxo",
+  mirrorGenerationFirstFree === LEAVES,
+  `${mirrorGenerationFirstFree} vs ${LEAVES} dustInitialUtxo events`,
+);
+
 const cuttable = (start: bigint, end: bigint): boolean => {
   try {
     mirror.collapsedCommitmentUpdate(start, end);
