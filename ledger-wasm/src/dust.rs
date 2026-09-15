@@ -1337,6 +1337,40 @@ impl DustLocalState {
         ))
     }
 
+    /// Cuts a collapsed update covering the generation indices
+    /// `[generation_index_start, generation_index_end]` (inclusive) out of this
+    /// state's generating tree, for another party to apply with
+    /// `applyGenerationCollapsedUpdate`.
+    ///
+    /// `newFromGenerationTree` does the same from the chain-side
+    /// `DustGenerationState`; this is the counterpart for a party that only
+    /// mirrors the tree in a `DustLocalState`. Throws when the range is empty,
+    /// when its end is at or past `generatingTreeFirstFree`, or when it crosses a
+    /// part of the tree this state has collapsed away.
+    #[wasm_bindgen(js_name = "collapsedGenerationUpdate")]
+    pub fn collapsed_generation_update(
+        &self,
+        generation_index_start: BigInt,
+        generation_index_end: BigInt,
+    ) -> Result<DustStateMerkleTreeCollapsedUpdate, JsError> {
+        let generation_index_start = u64::try_from(generation_index_start)
+            .map_err(|_| JsError::new("generation_index_start is out of range"))?;
+        let generation_index_end = u64::try_from(generation_index_end)
+            .map_err(|_| JsError::new("generation_index_end is out of range"))?;
+        Ok(DustStateMerkleTreeCollapsedUpdate(
+            self.0
+                .collapsed_generation_update(generation_index_start, generation_index_end)?,
+        ))
+    }
+
+    /// The next generation index this state will accept, i.e. the number of DUST
+    /// generation entries it has seen. The valid range for
+    /// `collapsedGenerationUpdate` is `[0, generatingTreeFirstFree - 1]`.
+    #[wasm_bindgen(getter = generatingTreeFirstFree)]
+    pub fn generating_tree_first_free(&self) -> BigInt {
+        BigInt::from(self.0.generating_tree_first_free())
+    }
+
     #[wasm_bindgen(js_name = "generatingTreeRoot")]
     pub fn generating_tree_root(&self) -> Result<JsValue, JsError> {
         Ok(self
@@ -1395,6 +1429,40 @@ impl DustLocalState {
         Ok(DustLocalState(
             self.0.apply_commitment_collapsed_update(update.as_ref())?,
         ))
+    }
+
+    /// Cuts a collapsed update covering the commitment indices
+    /// `[commitment_index_start, commitment_index_end]` (inclusive) out of this
+    /// state's commitment tree, for another party to apply with
+    /// `applyCommitmentCollapsedUpdate`.
+    ///
+    /// `newFromCommitmentTree` does the same from the chain-side `DustUtxoState`;
+    /// this is the counterpart for a party that only mirrors the tree in a
+    /// `DustLocalState`. Throws when the range is empty, when its end is at or
+    /// past `commitmentTreeFirstFree`, or when it crosses a part of the tree this
+    /// state has collapsed away.
+    #[wasm_bindgen(js_name = "collapsedCommitmentUpdate")]
+    pub fn collapsed_commitment_update(
+        &self,
+        commitment_index_start: BigInt,
+        commitment_index_end: BigInt,
+    ) -> Result<DustStateMerkleTreeCollapsedUpdate, JsError> {
+        let commitment_index_start = u64::try_from(commitment_index_start)
+            .map_err(|_| JsError::new("commitment_index_start is out of range"))?;
+        let commitment_index_end = u64::try_from(commitment_index_end)
+            .map_err(|_| JsError::new("commitment_index_end is out of range"))?;
+        Ok(DustStateMerkleTreeCollapsedUpdate(
+            self.0
+                .collapsed_commitment_update(commitment_index_start, commitment_index_end)?,
+        ))
+    }
+
+    /// The next commitment index this state will accept, i.e. the number of DUST
+    /// commitments it has seen. The valid range for `collapsedCommitmentUpdate`
+    /// is `[0, commitmentTreeFirstFree - 1]`.
+    #[wasm_bindgen(getter = commitmentTreeFirstFree)]
+    pub fn commitment_tree_first_free(&self) -> BigInt {
+        BigInt::from(self.0.commitment_tree_first_free())
     }
 
     #[wasm_bindgen(js_name = "commitmentTreeRoot")]

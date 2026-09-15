@@ -487,11 +487,39 @@ export class DustLocalState {
   removeGenerationInfo(generationIndex: bigint, generation: DustGenerationInfo): DustLocalState;
   collapseGenerationTree(generationIndexStart: bigint, generationIndexEnd: bigint): DustLocalState;
   applyGenerationCollapsedUpdate(update: DustStateMerkleTreeCollapsedUpdate): DustLocalState;
+  /**
+   * Cuts a collapsed update covering the generation indices
+   * `[generationIndexStart, generationIndexEnd]` (inclusive) out of this state's
+   * generating tree, for another party to apply with
+   * {@link DustLocalState.applyGenerationCollapsedUpdate}.
+   *
+   * {@link DustStateMerkleTreeCollapsedUpdate.newFromGenerationTree} does the
+   * same from the chain-side {@link DustGenerationState}; this is the
+   * counterpart for a party that only mirrors the tree in a
+   * {@link DustLocalState}. Throws when the range is empty, when its end is at
+   * or past {@link DustLocalState.generatingTreeFirstFree}, or when it crosses a
+   * part of the tree this state has collapsed away.
+   */
+  collapsedGenerationUpdate(generationIndexStart: bigint, generationIndexEnd: bigint): DustStateMerkleTreeCollapsedUpdate;
   generatingTreeRoot(): bigint | undefined;
   insertCommitment(commitmentIndex: bigint, qdo: QualifiedDustOutput, own_qdo: boolean): DustLocalState;
   removeCommitment(commitmentIndex: bigint): DustLocalState;
   collapseCommitmentTree(commitmentIndexStart: bigint, commitmentIndexEnd: bigint): DustLocalState;
   applyCommitmentCollapsedUpdate(update: DustStateMerkleTreeCollapsedUpdate): DustLocalState;
+  /**
+   * Cuts a collapsed update covering the commitment indices
+   * `[commitmentIndexStart, commitmentIndexEnd]` (inclusive) out of this state's
+   * commitment tree, for another party to apply with
+   * {@link DustLocalState.applyCommitmentCollapsedUpdate}.
+   *
+   * {@link DustStateMerkleTreeCollapsedUpdate.newFromCommitmentTree} does the
+   * same from the chain-side {@link DustUtxoState}; this is the counterpart for
+   * a party that only mirrors the tree in a {@link DustLocalState}. Throws when
+   * the range is empty, when its end is at or past
+   * {@link DustLocalState.commitmentTreeFirstFree}, or when it crosses a part of
+   * the tree this state has collapsed away.
+   */
+  collapsedCommitmentUpdate(commitmentIndexStart: bigint, commitmentIndexEnd: bigint): DustStateMerkleTreeCollapsedUpdate;
   commitmentTreeRoot(): bigint | undefined;
   spend(sk: DustSecretKey, utxo: QualifiedDustOutput, vFee: bigint, ctime: Date): [DustLocalState, DustSpend<PreProof>];
   processTtls(time: Date): DustLocalState;
@@ -514,6 +542,20 @@ export class DustLocalState {
   readonly utxos: QualifiedDustOutput[];
   readonly params: DustParameters;
   readonly syncTime: Date;
+  /**
+   * The next commitment index this state will accept, i.e. the number of DUST
+   * commitments it has seen. The valid range for
+   * {@link DustLocalState.collapsedCommitmentUpdate} is
+   * `[0, commitmentTreeFirstFree - 1]`.
+   */
+  readonly commitmentTreeFirstFree: bigint;
+  /**
+   * The next generation index this state will accept, i.e. the number of DUST
+   * generation entries it has seen. The valid range for
+   * {@link DustLocalState.collapsedGenerationUpdate} is
+   * `[0, generatingTreeFirstFree - 1]`.
+   */
+  readonly generatingTreeFirstFree: bigint;
 }
 
 /**
